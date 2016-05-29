@@ -181,6 +181,7 @@ int jpeg_show(struct jpeg_decdata *jpeg, unsigned char *pic, int width
 void kbd_init(void);
 void handle_15c2(struct bregs *regs);
 void process_key(u8 key);
+u8 kbc_enqueue_key(u8 scan_code, u8 ascii_code);
 
 // misc.c
 extern struct bios_config_table_s BIOS_CONFIG_TABLE __aligned(1);
@@ -228,6 +229,9 @@ extern int HaveRunPost;
 // serial.c
 void serial_setup(void);
 void lpt_setup(void);
+
+// serialconsole.c
+void uart_keyboard_handler(void);
 
 // vgahooks.c
 void handle_155f(struct bregs *regs);
