@@ -55,6 +55,8 @@ struct sdhci_s {
     u16 controller_version;
 } PACKED;
 
+#define PCI_SDHC_CTL             0xb0
+
 // SDHCI commands
 #define SCB_R0   0x00 // No response
 #define SCB_R48  0x1a // Response R1 (no data), R5, R6, R7
@@ -99,6 +101,7 @@ struct sdhci_s {
 #define SD_CAPLO_V33             (1<<24)
 #define SD_CAPLO_V30             (1<<25)
 #define SD_CAPLO_V18             (1<<26)
+#define SD_CAPLO_A64SUP          (1<<28)
 #define SD_CAPLO_BASECLOCK_SHIFT 8
 #define SD_CAPLO_BASECLOCK_MASK  0xff
 
@@ -479,7 +482,7 @@ sdcard_card_setup(struct sddrive_s *drive, int volt, int prio)
 
 // Setup and configure an SD card controller
 static void
-sdcard_controller_setup(struct sdhci_s *regs, int prio)
+sdcard_controller_setup(struct pci_device *pci, struct sdhci_s *regs, int prio)
 {
     // Initialize controller
     u32 present_state = readl(&regs->present_state);
@@ -497,10 +500,33 @@ sdcard_controller_setup(struct sdhci_s *regs, int prio)
     writew(&regs->error_irq_enable, 0x01ff);
     writew(&regs->error_irq_status, readw(&regs->error_irq_status));
     writeb(&regs->timeout_control, 0x0e); // Set to max timeout
+
+    u32 cap_lo_val = readl(&regs->cap_lo);
+    // A64BSup
+    cap_lo_val &= ~(1 << 29);
+    // VSup
+    cap_lo_val = (cap_lo_val & ~0x7000000) | (0x1000000 & 0x7000000);
+    // BaseFreq
+    cap_lo_val = (cap_lo_val & ~0xFF00) | (0x3200 & 0xFF00);
+    // Sdr50Tune
+    u32 cap_hi_val = readl(&regs->cap_hi);
+    // RetuneTimer
+    // DRV18D, DRV18C, DRV18A
+    // Ddr50Sup
+    // Sdr100Sup
+    // Sdr50Sup
     int volt = sdcard_set_power(regs);
     if (volt < 0)
         return;
 
+    // set SD control register
+    wait_preempt();
+    u32 sd_ctl = pci_config_readl(pci->bdf, PCI_SDHC_CTL);
+    // set HostVersionSel 31:24 to 2.0 host
+    sd_ctl = (sd_ctl & ~0xFF000000) | (0x01000000 & 0xFF000000);
+    // set CeAtaSup 7
+    sd_ctl |= (1 << 8);
+    pci_config_writel(pci->bdf, PCI_SDHC_CTL, sd_ctl);
     // Initialize card
     struct sddrive_s *drive = malloc_fseg(sizeof(*drive));
     if (!drive) {
@@ -530,7 +556,7 @@ sdcard_pci_setup(void *data)
     if (!regs)
         return;
     int prio = bootprio_find_pci_device(pci);
-    sdcard_controller_setup(regs, prio);
+    sdcard_controller_setup(pci, regs, prio);
 }
 
 static void
