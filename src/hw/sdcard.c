@@ -8,6 +8,7 @@
 #include "malloc.h" // malloc_fseg
 #include "output.h" // znprintf
 #include "pcidevice.h" // foreachpci
+#include "pci.h" // pci_config_writel
 #include "pci_ids.h" // PCI_CLASS_SYSTEM_SDHCI
 #include "pci_regs.h" // PCI_BASE_ADDRESS_0
 #include "romfile.h" // romfile_findprefix
@@ -510,23 +511,42 @@ sdcard_controller_setup(struct pci_device *pci, struct sdhci_s *regs, int prio)
     cap_lo_val = (cap_lo_val & ~0xFF00) | (0x3200 & 0xFF00);
     // Sdr50Tune
     u32 cap_hi_val = readl(&regs->cap_hi);
+    cap_hi_val &= ~(1 << 14);
     // RetuneTimer
+    cap_hi_val = (cap_hi_val & ~0xC000);
     // DRV18D, DRV18C, DRV18A
+    cap_hi_val |= (0x3 << 5);
+
+
     // Ddr50Sup
     // Sdr100Sup
     // Sdr50Sup
+    cap_hi_val &= ~0x3;
+
+    writel(&regs->cap_lo, cap_lo_val);
+    writel(&regs->cap_hi, cap_hi_val);
+
+    dprintf(3, "sd 2.0 sdhci@%p ver=%x cap=%x %x\n", regs
+            , readw(&regs->controller_version)
+            , readl(&regs->cap_lo), readl(&regs->cap_hi));
+
     int volt = sdcard_set_power(regs);
     if (volt < 0)
         return;
 
-    // set SD control register
-    wait_preempt();
-    u32 sd_ctl = pci_config_readl(pci->bdf, PCI_SDHC_CTL);
-    // set HostVersionSel 31:24 to 2.0 host
-    sd_ctl = (sd_ctl & ~0xFF000000) | (0x01000000 & 0xFF000000);
-    // set CeAtaSup 7
-    sd_ctl |= (1 << 8);
-    pci_config_writel(pci->bdf, PCI_SDHC_CTL, sd_ctl);
+    if (pci) {
+        // set SD control register
+        wait_preempt();
+        u32 sd_ctl = pci_config_readl(pci->bdf, PCI_SDHC_CTL);
+        // set HostVersionSel 31:24 to 2.0 host
+        sd_ctl = (sd_ctl & ~0xFF000000) | (0x01000000 & 0xFF000000);
+        // set CeAtaSup 7
+        sd_ctl |= (1 << 8);
+        pci_config_writel(pci->bdf, PCI_SDHC_CTL, sd_ctl);
+        sd_ctl = pci_config_readl(pci->bdf, PCI_SDHC_CTL);
+        dprintf(3, "sd_ctl=%x\n", sd_ctl);
+    }
+
     // Initialize card
     struct sddrive_s *drive = malloc_fseg(sizeof(*drive));
     if (!drive) {
@@ -566,7 +586,7 @@ sdcard_romfile_setup(void *data)
     int prio = bootprio_find_named_rom(file->name, 0);
     u32 addr = romfile_loadint(file->name, 0);
     dprintf(1, "Starting sdcard controller check at addr %x\n", addr);
-    sdcard_controller_setup((void*)addr, prio);
+    sdcard_controller_setup(NULL, (void*)addr, prio);
 }
 
 void
