@@ -2,6 +2,7 @@
 //
 // Copyright (C) 2008-2013  Kevin O'Connor <kevin@koconnor.net>
 // Copyright (C) 2002  MandrakeSoft S.A.
+// Copyright (C) 2013-2014  Sage Electronic Engineering, LLC.
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
@@ -10,7 +11,6 @@
 #include "config.h" // CONFIG_*
 #include "fw/paravirt.h" // qemu_cfg_show_boot_menu
 #include "hw/pci.h" // pci_bdf_to_*
-#include "hw/pcidevice.h" // struct pci_device
 #include "hw/rtc.h" // rtc_read
 #include "hw/usb.h" // struct usbdevice_s
 #include "list.h" // hlist_node
@@ -20,8 +20,8 @@
 #include "std/disk.h" // struct mbr_s
 #include "string.h" // memset
 #include "util.h" // irqtimer_calc
-#include "tcgbios.h" // tpm_*
-
+#include "fw/coreboot.h" // get_cbmem_bootorder_file
+#include "boot.h" // bootmapper struct/defines
 
 /****************************************************************
  * Boot priority ordering
@@ -36,7 +36,14 @@ loadBootOrder(void)
     if (!CONFIG_BOOTORDER)
         return;
 
-    char *f = romfile_loadfile("bootorder", NULL);
+    char *f = NULL;
+
+    if (CONFIG_CHECK_FOR_BOOTORDER_IN_CBMEM)
+        f = (char *)get_cbmem_bootorder_file();
+
+    if (f == NULL)
+        f = romfile_loadfile("bootorder", NULL);
+
     if (!f)
         return;
 
@@ -55,7 +62,7 @@ loadBootOrder(void)
         return;
     }
 
-    dprintf(1, "boot order:\n");
+    dprintf(2, "boot order:\n");
     i = 0;
     do {
         Bootorder[i] = f;
@@ -63,7 +70,7 @@ loadBootOrder(void)
         if (f)
             *(f++) = '\0';
         Bootorder[i] = nullTrailingSpace(Bootorder[i]);
-        dprintf(1, "%d: %s\n", i+1, Bootorder[i]);
+        dprintf(2, "%d: %s\n", i+1, Bootorder[i]);
         i++;
     } while (f);
 }
@@ -71,21 +78,37 @@ loadBootOrder(void)
 // See if 'str' starts with 'glob' - if glob contains an '*' character
 // it will match any number of characters in str that aren't a '/' or
 // the next glob character.
-static char *
+static int
 glob_prefix(const char *glob, const char *str)
 {
+    // glob[] comes from seabios, str[] comes from bootorder file
     for (;;) {
-        if (!*glob && (!*str || *str == '/'))
-            return (char*)str;
-        if (*glob == '*') {
-            if (!*str || *str == '/' || *str == glob[1])
+        if (!glob[0] && (!str[0] || str[0] == '/'))
+            return 1;
+        if (str[0] == '*') {
+            if (!str[1]) // [*,0] will wildcard anything
+                return 1;
+            if (glob[0] == '*') {
+                if (glob[1] == str[1]) // next char match
+                    glob++;
+                    str++;
+                    continue;
+            }
+            else if (glob[0] == str[1])
+                str++;
+            else
+                glob++;
+            continue;
+        }
+        if (glob[0] == '*') {
+            if (!str[0] || str[0] == '/' || str[0] == glob[1])
                 glob++;
             else
                 str++;
             continue;
         }
-        if (*glob != *str)
-            return NULL;
+        if (glob[0] != str[0])
+            return 0;
         glob++;
         str++;
     }
@@ -97,37 +120,21 @@ find_prio(const char *glob)
 {
     dprintf(1, "Searching bootorder for: %s\n", glob);
     int i;
-    for (i = 0; i < BootorderCount; i++)
-        if (glob_prefix(glob, Bootorder[i]))
-            return i+1;
-    return -1;
-}
-
-// search for 'ipxe enable' bit value
-int find_pxen(void)
-{
-    int i = 0;
-    for (i=0; i < BootorderCount; i++)
-    {
-        if (glob_prefix("pxen0", Bootorder[i]))
-            return 0;
-        if (glob_prefix("pxen1", Bootorder[i]))
-            return 1;
+    for (i = 0; i < BootorderCount; i++) {
+        // If device in bootorder is preceded with a '!'
+        // we want to remove it as a bootable device
+        if (*(Bootorder[i]) == '!') {
+            if (glob_prefix(glob, Bootorder[i] + 1)) {
+                dprintf(1, "removing %s as a bootable device\n", Bootorder[i]);
+                return 0xdead; // priority must be >= 0
+            }
+        }
+        else {
+            if (glob_prefix(glob, Bootorder[i]))
+                return i+1;
+        }
     }
     return -1;
-}
-
-// search for 'boot from usb' bit value
-// if it doesn't exist - set to enabled
-static int find_usben(void)
-{
-     int i;
-     for (i=0; i < BootorderCount; i++)
-     {
-         if (glob_prefix("usben0", Bootorder[i]))
-             return 0;
-     }
-     return 1;
 }
 
 #define FW_PCI_DOMAIN "/pci@i0cf8"
@@ -140,9 +147,9 @@ build_pci_path(char *buf, int max, const char *devname, struct pci_device *pci)
     if (pci->parent) {
         p = build_pci_path(p, max, "pci-bridge", pci->parent);
     } else {
-        p += snprintf(p, buf+max-p, "%s", FW_PCI_DOMAIN);
         if (pci->rootbus)
-            p += snprintf(p, buf+max-p, ",%x", pci->rootbus);
+            p += snprintf(p, max, "/pci-root@%x", pci->rootbus);
+        p += snprintf(p, buf+max-p, "%s", FW_PCI_DOMAIN);
     }
 
     int dev = pci_bdf_to_dev(pci->bdf), fn = pci_bdf_to_fn(pci->bdf);
@@ -174,7 +181,7 @@ int bootprio_find_scsi_device(struct pci_device *pci, int target, int lun)
     // Find scsi drive - for example: /pci@i0cf8/scsi@5/channel@0/disk@1,0
     char desc[256], *p;
     p = build_pci_path(desc, sizeof(desc), "*", pci);
-    snprintf(p, desc+sizeof(desc)-p, "/*@0/*@%x,%x", target, lun);
+    snprintf(p, desc+sizeof(desc)-p, "/*@0/*@%d,%d", target, lun);
     return find_prio(desc);
 }
 
@@ -218,7 +225,7 @@ int bootprio_find_pci_rom(struct pci_device *pci, int instance)
     char desc[256], *p;
     p = build_pci_path(desc, sizeof(desc), "*", pci);
     if (instance)
-        snprintf(p, desc+sizeof(desc)-p, ":rom%x", instance);
+        snprintf(p, desc+sizeof(desc)-p, ":rom%d", instance);
     return find_prio(desc);
 }
 
@@ -230,7 +237,7 @@ int bootprio_find_named_rom(const char *name, int instance)
     char desc[256], *p;
     p = desc + snprintf(desc, sizeof(desc), "/rom@%s", name);
     if (instance)
-        snprintf(p, desc+sizeof(desc)-p, ":rom%x", instance);
+        snprintf(p, desc+sizeof(desc)-p, ":rom%d", instance);
     return find_prio(desc);
 }
 
@@ -253,7 +260,7 @@ int bootprio_find_usb(struct usbdevice_s *usbdev, int lun)
     char desc[256], *p;
     p = build_pci_path(desc, sizeof(desc), "usb", usbdev->hub->cntl->pci);
     p = build_usb_path(p, desc+sizeof(desc)-p, usbdev->hub);
-    snprintf(p, desc+sizeof(desc)-p, "/storage@%x/*@0/*@0,%x"
+    snprintf(p, desc+sizeof(desc)-p, "/storage@%x/*@0/*@0,%d"
              , usbdev->port+1, lun);
     int ret = find_prio(desc);
     if (ret >= 0)
@@ -346,6 +353,9 @@ bootentry_add(int type, int prio, u32 data, const char *desc)
         warn_noalloc();
         return;
     }
+    if (prio == 0xdead) {
+        return; // device was preceded with a '!' in bootorder
+    }
     be->type = type;
     be->priority = prio;
     be->data = data;
@@ -408,10 +418,8 @@ boot_add_floppy(struct drive_s *drive_g, const char *desc, int prio)
 void
 boot_add_hd(struct drive_s *drive_g, const char *desc, int prio)
 {
-    int usben = find_usben();
-    if ((glob_prefix("USB*", desc) == NULL) || usben == 1)
-        bootentry_add(IPL_TYPE_HARDDISK, defPrio(prio, DefaultHDPrio)
-                        , (u32)drive_g, desc);
+    bootentry_add(IPL_TYPE_HARDDISK, defPrio(prio, DefaultHDPrio)
+                  , (u32)drive_g, desc);
 }
 
 void
@@ -457,7 +465,7 @@ get_raw_keystroke(void)
 }
 
 // Read a keystroke - waiting up to 'msec' milliseconds.
-int
+static int
 get_keystroke(int msec)
 {
     u32 end = irqtimer_calc(msec);
@@ -483,6 +491,13 @@ interactive_bootmenu(void)
 {
     // XXX - show available drives?
 
+#if CONFIG_PRINT_TIMESTAMPS
+    u64 tscval = rdtscll();
+    dprintf(1, "TSC: Boot Device Menu: 0x%08lx_%08lx\n",
+            (unsigned long)(tscval >> 32),
+            (unsigned long)tscval);
+#endif
+
     if (! CONFIG_BOOTMENU || !romfile_loadint("etc/show-boot-menu", 1))
         return;
 
@@ -490,8 +505,8 @@ interactive_bootmenu(void)
         ;
 
     char *bootmsg = romfile_loadfile("etc/boot-menu-message", NULL);
-    int menukey = romfile_loadint("etc/boot-menu-key", 1);
-    printf("%s", bootmsg ?: "\nPress ESC for boot menu.\n\n");
+    int menukey = romfile_loadint("etc/boot-menu-key", 0x86);
+    printf("%s", bootmsg ?: "\nPress F12 for boot menu.\n\n");
     free(bootmsg);
 
     u32 menutime = romfile_loadint("etc/boot-menu-wait", DEFAULT_BOOTMENU_WAIT);
@@ -507,34 +522,56 @@ interactive_bootmenu(void)
     printf("Select boot device:\n\n");
     wait_threads();
 
+    struct map_struct *f = romfile_loadfile("etc/bootmapper", NULL);
+
     // Show menu items
     int maxmenu = 0;
+    int mapcnt, maxmap=0;
     struct bootentry_s *pos;
     hlist_for_each_entry(pos, &BootList, node) {
         char desc[60];
         maxmenu++;
-        printf("%d. %s\n", maxmenu
-               , strtcpy(desc, pos->description, ARRAY_SIZE(desc)));
-    }
-    if (tpm_can_show_menu()) {
-        printf("\nt. TPM Configuration\n");
+        u8 mapped = 0;
+        if (f) { // we are using a bootmapper file
+            for (mapcnt=0 ; ; mapcnt++) {
+                if (f[mapcnt].map_char == 0xff) {
+                    maxmap = mapcnt;
+                    break;
+                }
+                u8 tl;
+                // check map_string[] for the EOL char (i.e. "$")
+                for (tl = 0; tl < BOOTMAPPER_STRING_LENGTH; tl++) {
+                    if (f[mapcnt].map_string[tl] == '$') {
+                        f[mapcnt].map_string[tl] = 0;
+                        break;
+                    }
+                }
+                if (!strcmp(f[mapcnt].map_string, strtcpy(desc, pos->description, ARRAY_SIZE(desc)))) {
+                    printf("%c. %s\n", f[mapcnt].map_char, strtcpy(desc, pos->description, ARRAY_SIZE(desc)));
+                    f[mapcnt].map_num = maxmenu+1;
+                    mapped = 1;
+                }
+            }
+        }
+        if (!mapped)
+            printf("%d. %s\n", maxmenu, strtcpy(desc, pos->description, ARRAY_SIZE(desc)));
     }
 
-    // Get key press.  If the menu key is ESC, do not restart boot unless
-    // 1.5 seconds have passed.  Otherwise users (trained by years of
-    // repeatedly hitting keys to enter the BIOS) will end up hitting ESC
-    // multiple times and immediately booting the primary boot device.
-    int esc_accepted_time = irqtimer_calc(menukey == 1 ? 1500 : 0);
+    // Get key press
     for (;;) {
         scan_code = get_keystroke(1000);
-        if (scan_code == 1 && !irqtimer_check(esc_accepted_time))
-            continue;
-        if (tpm_can_show_menu() && scan_code == 20 /* t */) {
-            printf("\n");
-            tpm_menu();
-        }
         if (scan_code >= 1 && scan_code <= maxmenu+1)
             break;
+        if (f) { // we are using a bootmapper file
+            for ( mapcnt=0; mapcnt <= maxmap ; mapcnt++ ) {
+                if (scan_code == strtol(f[mapcnt].map_key, NULL, 16)) {
+                    scan_code = f[mapcnt].map_num;
+                    maxmap = 0; // use as a semiphore
+                    break;
+                }
+            }
+            if (!maxmap) break;
+        }
     }
     printf("\n");
     if (scan_code == 0x01)
@@ -582,6 +619,13 @@ bcv_prepboot(void)
     if (! CONFIG_BOOT)
         return;
 
+#if CONFIG_PRINT_TIMESTAMPS
+    u64 tscval = rdtscll();
+    dprintf(1, "TSC: Start load from boot device: 0x%08lx_%08lx\n",
+            (unsigned long)(tscval >> 32),
+            (unsigned long)tscval);
+#endif
+
     int haltprio = find_prio("HALT");
     if (haltprio >= 0)
         bootentry_add(IPL_TYPE_HALT, haltprio, 0, "HALT");
@@ -625,6 +669,12 @@ bcv_prepboot(void)
 static void
 call_boot_entry(struct segoff_s bootsegip, u8 bootdrv)
 {
+#if CONFIG_PRINT_TIMESTAMPS
+    u64 tscval = rdtscll();
+    dprintf(1, "TSC: End of seabios: 0x%08lx_%08lx\n",
+            (unsigned long)(tscval >> 32),
+            (unsigned long)tscval);
+#endif
     dprintf(1, "Booting from %04x:%04x\n", bootsegip.seg, bootsegip.offset);
     struct bregs br;
     memset(&br, 0, sizeof(br));
@@ -666,8 +716,6 @@ boot_disk(u8 bootdrv, int checksig)
         }
     }
 
-    tpm_add_bcv(bootdrv, MAKE_FLATPTR(bootseg, 0), 512);
-
     /* Canonicalize bootseg:bootip */
     u16 bootip = (bootseg & 0x0fff) << 4;
     bootseg &= 0xf000;
@@ -689,11 +737,8 @@ boot_cdrom(struct drive_s *drive_g)
         return;
     }
 
-    u8 bootdrv = CDEmu.emulated_drive;
+    u8 bootdrv = CDEmu.emulated_extdrive;
     u16 bootseg = CDEmu.load_segment;
-
-    tpm_add_cdrom(bootdrv, MAKE_FLATPTR(bootseg, 0), 512);
-
     /* Canonicalize bootseg:bootip */
     u16 bootip = (bootseg & 0x0fff) << 4;
     bootseg &= 0xf000;
@@ -738,7 +783,10 @@ boot_fail(void)
         yield_toirq();
     }
     printf("Rebooting.\n");
-    reset();
+    struct bregs br;
+    memset(&br, 0, sizeof(br));
+    br.code = SEGOFF(SEG_BIOS, (u32)reset_vector);
+    farcall16big(&br);
 }
 
 // Determine next boot method and attempt a boot using it.

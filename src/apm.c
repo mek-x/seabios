@@ -9,10 +9,29 @@
 #include "biosvar.h" // GET_GLOBAL
 #include "bregs.h" // struct bregs
 #include "config.h" // CONFIG_*
+#include "fw/paravirt.h" // runningOnQEMU
 #include "output.h" // dprintf
 #include "stacks.h" // yield_toirq
 #include "util.h" // apm_shutdown
 #include "x86.h" // outb
+
+static void
+out_str(const char *str_cs)
+{
+    if (!runningOnQEMU()) {
+        dprintf(1, "APM request '%s'\n", str_cs);
+        return;
+    }
+
+    u8 *s = (u8*)str_cs;
+    for (;;) {
+        u8 c = GET_GLOBAL(*s);
+        if (!c)
+            break;
+        outb(c, PORT_BIOS_APM);
+        s++;
+    }
+}
 
 // APM installation check
 static void
@@ -35,11 +54,14 @@ handle_155301(struct bregs *regs)
     set_success(regs);
 }
 
+// Assembler entry points defined in romlayout.S
+extern void entry_apm16(void);
+extern void entry_apm32(void);
+
 // APM 16 bit protected mode interface connect
 static void
 handle_155302(struct bregs *regs)
 {
-    extern void entry_apm16(void);
     regs->bx = (u32)entry_apm16;
     regs->ax = SEG_BIOS; // 16 bit code segment base
     regs->si = 0xfff0;   // 16 bit code segment size
@@ -52,7 +74,6 @@ handle_155302(struct bregs *regs)
 static void
 handle_155303(struct bregs *regs)
 {
-    extern void entry_apm32(void);
     regs->ax = SEG_BIOS; // 32 bit code segment base
     regs->ebx = (u32)entry_apm32;
     regs->cx = SEG_BIOS; // 16 bit code segment base
@@ -90,10 +111,11 @@ void
 apm_shutdown(void)
 {
     u16 pm1a_cnt = GET_GLOBAL(acpi_pm1a_cnt);
-    if (pm1a_cnt)
-        outw(0x2000, pm1a_cnt);
 
     irq_disable();
+    if (pm1a_cnt)
+        outw(0x2000, pm1a_cnt);
+    out_str("Shutdown");
     for (;;)
         hlt();
 }
@@ -108,10 +130,10 @@ handle_155307(struct bregs *regs)
     }
     switch (regs->cx) {
     case 1:
-        dprintf(1, "APM standby request\n");
+        out_str("Standby");
         break;
     case 2:
-        dprintf(1, "APM suspend request\n");
+        out_str("Suspend");
         break;
     case 3:
         apm_shutdown();

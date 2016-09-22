@@ -22,6 +22,7 @@ struct usb_pipe {
 struct usbdevice_s {
     struct usbhub_s *hub;
     struct usb_pipe *defpipe;
+    u32 slotid;
     u32 port;
     struct usb_config_descriptor *config;
     struct usb_interface_descriptor *iface;
@@ -45,7 +46,7 @@ struct usbhub_s {
     struct usbdevice_s *usbdev;
     struct usb_s *cntl;
     struct mutex_s lock;
-    u32 detectend;
+    u32 powerwait;
     u32 port;
     u32 threads;
     u32 portcount;
@@ -77,15 +78,11 @@ struct usbhub_op_s {
  ****************************************************************/
 
 // USB mandated timings (in ms)
-#define USB_TIME_SIGATT 500 // 100		// WIV changed to 500 to make ADATA CIO3 stick working ( 200 is sufficient for SanDisk Ultra USB 3.0)
+#define USB_TIME_SIGATT 100
 #define USB_TIME_ATTDB  100
 #define USB_TIME_DRST   10
 #define USB_TIME_DRSTR  50
 #define USB_TIME_RSTRCY 10
-
-#define USB_TIME_STATUS  50
-#define USB_TIME_DATAIN  500
-#define USB_TIME_COMMAND 5000
 
 #define USB_TIME_SETADDR_RECOVERY 2
 
@@ -210,8 +207,6 @@ struct usb_endpoint_descriptor {
 #define USB_ENDPOINT_XFER_INT           3
 #define USB_ENDPOINT_MAX_ADJUSTABLE     0x80
 
-#define USB_CONTROL_SETUP_SIZE          8
-
 
 /****************************************************************
  * usb mass storage flags
@@ -229,24 +224,21 @@ struct usb_endpoint_descriptor {
  ****************************************************************/
 
 // usb.c
+struct usb_pipe *usb_alloc_pipe(struct usbdevice_s *usbdev
+                                , struct usb_endpoint_descriptor *epdesc);
 int usb_send_bulk(struct usb_pipe *pipe, int dir, void *data, int datasize);
 int usb_poll_intr(struct usb_pipe *pipe, void *data);
 int usb_32bit_pipe(struct usb_pipe *pipe_fl);
-struct usb_pipe *usb_alloc_pipe(struct usbdevice_s *usbdev
-                                , struct usb_endpoint_descriptor *epdesc);
-void usb_free_pipe(struct usbdevice_s *usbdev, struct usb_pipe *pipe);
-int usb_send_default_control(struct usb_pipe *pipe
-                             , const struct usb_ctrlrequest *req, void *data);
-int usb_is_freelist(struct usb_s *cntl, struct usb_pipe *pipe);
-void usb_add_freelist(struct usb_pipe *pipe);
-struct usb_pipe *usb_get_freelist(struct usb_s *cntl, u8 eptype);
+int send_default_control(struct usb_pipe *pipe, const struct usb_ctrlrequest *req
+                         , void *data);
+void free_pipe(struct usb_pipe *pipe);
+struct usb_pipe *usb_getFreePipe(struct usb_s *cntl, u8 eptype);
 void usb_desc2pipe(struct usb_pipe *pipe, struct usbdevice_s *usbdev
                    , struct usb_endpoint_descriptor *epdesc);
-int usb_get_period(struct usbdevice_s *usbdev
-                   , struct usb_endpoint_descriptor *epdesc);
-int usb_xfer_time(struct usb_pipe *pipe, int datalen);
-struct usb_endpoint_descriptor *usb_find_desc(struct usbdevice_s *usbdev
-                                              , int type, int dir);
+int usb_getFrameExp(struct usbdevice_s *usbdev
+                    , struct usb_endpoint_descriptor *epdesc);
+struct usb_endpoint_descriptor *findEndPointDesc(struct usbdevice_s *usbdev
+                                                 , int type, int dir);
 void usb_enumerate(struct usbhub_s *hub);
 void usb_setup(void);
 

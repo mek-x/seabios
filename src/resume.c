@@ -16,7 +16,9 @@
 #include "std/bda.h" // struct bios_data_area_s
 #include "string.h" // memset
 #include "util.h" // dma_setup
-#include "tcgbios.h" // tpm_s3_resume
+
+// Indicator if POST phase has been run.
+int HaveRunPost VARFSEG;
 
 // Handler for post calls that look like a resume.
 void VISIBLE16
@@ -100,8 +102,6 @@ s3_resume(void)
 
     pci_resume();
 
-    /* resume TPM before we may measure option roms */
-    tpm_s3_resume();
     s3_resume_vga();
 
     make_bios_readonly();
@@ -114,10 +114,19 @@ s3_resume(void)
     farcall16big(&br);
 }
 
+u8 HaveAttemptedReboot VARLOW;
+
 // Attempt to invoke a hard-reboot.
 static void
 tryReboot(void)
 {
+    if (HaveAttemptedReboot) {
+        // Hard reboot has failed - try to shutdown machine.
+        dprintf(1, "Unable to hard-reboot machine - attempting shutdown.\n");
+        apm_shutdown();
+    }
+    HaveAttemptedReboot = 1;
+
     dprintf(1, "Attempting a hard reboot\n");
 
     // Setup for reset on qemu.

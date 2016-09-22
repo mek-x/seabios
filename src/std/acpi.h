@@ -42,31 +42,6 @@ struct rsdp_descriptor {        /* Root System Descriptor Pointer */
     u8  asl_compiler_id [4];    /* ASL compiler vendor ID */ \
     u32 asl_compiler_revision;  /* ASL compiler revision number */
 
-/*
- * Fixed ACPI Description Table Fixed Feature Flags
- */
-#define    ACPI_FADT_F_WBINVD            (1 << 0)
-#define    ACPI_FADT_F_WBINVD_FLUSH      (1 << 1)
-#define    ACPI_FADT_F_PROC_C1           (1 << 2)
-#define    ACPI_FADT_F_P_LVL2_UP         (1 << 3)
-#define    ACPI_FADT_F_PWR_BUTTON        (1 << 4)
-#define    ACPI_FADT_F_SLP_BUTTON        (1 << 5)
-#define    ACPI_FADT_F_FIX_RTC           (1 << 6)
-#define    ACPI_FADT_F_RTC_S4            (1 << 7)
-#define    ACPI_FADT_F_TMR_VAL_EXT       (1 << 8)
-#define    ACPI_FADT_F_DCK_CAP           (1 << 9)
-#define    ACPI_FADT_F_RESET_REG_SUP     (1 << 10)
-#define    ACPI_FADT_F_SEALED_CASE       (1 << 11)
-#define    ACPI_FADT_F_HEADLESS          (1 << 12)
-#define    ACPI_FADT_F_CPU_SW_SLP        (1 << 13)
-#define    ACPI_FADT_F_PCI_EXP_WAK       (1 << 14)
-#define    ACPI_FADT_F_USE_PLATFORM_CLOCK (1 << 15)
-#define    ACPI_FADT_F_S4_RTC_STS_VALID   (1 << 16)
-#define    ACPI_FADT_F_REMOTE_POWER_ON_CAPABLE  (1 << 17)
-#define    ACPI_FADT_F_FORCE_APIC_CLUSTER_MODEL  (1 << 18)
-#define    ACPI_FADT_F_FORCE_APIC_PHYSICAL_DESTINATION_MODE  (1 << 19)
-#define    ACPI_FADT_F_HW_REDUCED_ACPI    (1 << 20)
-#define    ACPI_FADT_F_LOW_POWER_S0_IDLE_CAPABLE  (1 << 21)
 
 /*
  * ACPI 1.0 Fixed ACPI Description Table (FADT)
@@ -293,25 +268,5 @@ struct acpi_table_mcfg {
     u8 reserved[8];
     struct acpi_mcfg_allocation allocation[0];
 } PACKED;
-
-
-struct rsdt_descriptor {
-    ACPI_TABLE_HEADER_DEF
-    u32 entry[1];
-} PACKED;
-
-#define TCPA_SIGNATURE 0x41504354
-struct tcpa_descriptor_rev2
-{
-    ACPI_TABLE_HEADER_DEF
-    u16  platform_class;
-    u32  log_area_minimum_length;
-    u64  log_area_start_address;
-} PACKED;
-
-/* TCPA ACPI definitions */
-#define TCPA_ACPI_CLASS_CLIENT          0
-#define TCPA_ACPI_CLASS_SERVER          1
-
 
 #endif // acpi.h

@@ -56,13 +56,14 @@ static int
 find_videomode(struct vbe_info *vesa_info, struct vbe_mode_info *mode_info
                , int width, int height, int bpp_req)
 {
-    dprintf(3, "Finding vesa mode with dimensions %d/%d\n", width, height);
+    dprintf(3, "Finding vesa mode with dimensions %d x %d (%d bpp)\n",
+           width, height, bpp_req);
     u16 *videomodes = SEGOFF_TO_FLATPTR(vesa_info->video_mode);
     for (;; videomodes++) {
         u16 videomode = *videomodes;
         if (videomode == 0xffff) {
-            dprintf(1, "Unable to find vesa video mode dimensions %d/%d\n"
-                    , width, height);
+            dprintf(1, "Unable to find vesa video mode with dimensions %d x %d (%d bpp)\n",
+                width, height, bpp_req);
             return -1;
         }
         struct bregs br;
@@ -81,13 +82,18 @@ find_videomode(struct vbe_info *vesa_info, struct vbe_mode_info *mode_info
             continue;
         u8 depth = mode_info->bits_per_pixel;
         if (bpp_req == 0) {
-            if ((depth != 16 && depth != 24 && depth != 32)
-                || mode_info->green_size == 5)
+            if (depth != 16 && depth != 24 && depth != 32)
                 continue;
         } else {
             if (depth != bpp_req)
                 continue;
         }
+        // if this is 16 bits per pixel but R:G:B is not 5:6:5 format, continue
+        if ((depth == 16) &&
+           ((mode_info->red_size != 5) ||
+            (mode_info->green_size != 6) ||
+            (mode_info->blue_size != 5)))
+            	continue;
         return videomode;
     }
 }

@@ -15,5 +15,6 @@ struct romfile_s *romfile_findprefix(const char *prefix, struct romfile_s *prev)
 struct romfile_s *romfile_find(const char *name);
 void *romfile_loadfile(const char *name, int *psize);
 u64 romfile_loadint(const char *name, u64 defval);
+char *cbfs_find_string(const char *string, const char *filename);
 
 #endif // romfile.h

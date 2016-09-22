@@ -9,19 +9,11 @@
  ****************************************************************/
 
 struct disk_op_s {
+    u64 lba;
     void *buf_fl;
     struct drive_s *drive_gf;
-    u8 command;
     u16 count;
-    union {
-        // Commands: READ, WRITE, VERIFY, SEEK, FORMAT
-        u64 lba;
-        // Commands: SCSI
-        struct {
-            u16 blocksize;
-            void *cdbcmd;
-        };
-    };
+    u8 command;
 };
 
 #define CMD_RESET   0x00
@@ -31,7 +23,6 @@ struct disk_op_s {
 #define CMD_FORMAT  0x05
 #define CMD_SEEK    0x07
 #define CMD_ISREADY 0x10
-#define CMD_SCSI    0x20
 
 
 /****************************************************************
@@ -43,6 +34,21 @@ struct chs_s {
     u16 cylinder;
     u16 sector;
     u16 pad;
+};
+
+// ElTorito Device Emulation data
+struct cdemu_s {
+    struct drive_s *emulated_drive_gf;
+    u32 ilba;
+    u16 buffer_segment;
+    u16 load_segment;
+    u16 sector_count;
+    u8  active;
+    u8  media;
+    u8  emulated_extdrive;
+
+    // Virtual device
+    struct chs_s lchs;
 };
 
 struct drive_s {
@@ -80,8 +86,7 @@ struct drive_s {
 #define DTYPE_ESP_SCSI     0x81
 #define DTYPE_MEGASAS      0x82
 #define DTYPE_PVSCSI       0x83
-#define DTYPE_MPT_SCSI     0x84
-#define DTYPE_SDCARD       0x90
+#define DTYPE_SD           0x90
 
 #define MAXDESCSIZE 80
 
@@ -103,6 +108,7 @@ struct drive_s {
  ****************************************************************/
 
 // block.c
+extern struct dpte_s DefaultDPTE;
 extern u8 FloppyCount, CDCount;
 extern u8 *bounce_buf_fl;
 struct drive_s *getDrive(u8 exttype, u8 extdriveoffset);
@@ -110,11 +116,19 @@ int getDriveId(u8 exttype, struct drive_s *drive);
 void map_floppy_drive(struct drive_s *drive);
 void map_hd_drive(struct drive_s *drive);
 void map_cd_drive(struct drive_s *drive);
-struct int13dpt_s;
-int fill_edd(struct segoff_s edd, struct drive_s *drive_gf);
-void block_setup(void);
-int default_process_op(struct disk_op_s *op);
+void map_sd_drive(struct drive_s *drive);
+struct bregs;
+void __disk_ret(struct bregs *regs, u32 linecode, const char *fname);
+void __disk_ret_unimplemented(struct bregs *regs, u32 linecode
+                              , const char *fname);
 int process_op(struct disk_op_s *op);
+int send_disk_op(struct disk_op_s *op);
 int create_bounce_buf(void);
+
+// Helper function for setting up a return code.
+#define disk_ret(regs, code) \
+    __disk_ret((regs), (code) | (__LINE__ << 8), __func__)
+#define disk_ret_unimplemented(regs, code) \
+    __disk_ret_unimplemented((regs), (code) | (__LINE__ << 8), __func__)
 
 #endif // block.h

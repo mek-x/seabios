@@ -1,5 +1,4 @@
 // MPTable generation (on emulators)
-// DO NOT ADD NEW FEATURES HERE.  (See paravirt.c / biostables.c instead.)
 //
 // Copyright (C) 2008-2010  Kevin O'Connor <kevin@koconnor.net>
 // Copyright (C) 2006 Fabrice Bellard
@@ -7,9 +6,8 @@
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include "config.h" // CONFIG_*
-#include "hw/pci.h" // pci_bdf_to_bus
-#include "hw/pcidevice.h" // foreachpci
-#include "hw/pci_regs.h" // PCI_INTERRUPT_PIN
+#include "hw/pci.h"
+#include "hw/pci_regs.h"
 #include "malloc.h" // free
 #include "output.h" // dprintf
 #include "romfile.h" // romfile_loadint
@@ -184,14 +182,29 @@ mptable_setup(void)
     config->length = length;
     config->checksum -= checksum(config, length);
 
-    // floating pointer structure
-    struct mptable_floating_s floating;
-    memset(&floating, 0, sizeof(floating));
-    floating.signature = MPTABLE_SIGNATURE;
-    floating.physaddr = (u32)config;
-    floating.length = 1;
-    floating.spec_rev = 4;
-    floating.checksum -= checksum(&floating, sizeof(floating));
-    copy_mptable(&floating);
+    // Allocate final memory locations.  (In theory the config
+    // structure can go in high memory, but Linux kernels before
+    // v2.6.30 crash with that.)
+    struct mptable_config_s *finalconfig = malloc_fseg(length);
+    struct mptable_floating_s *floating = malloc_fseg(sizeof(*floating));
+    if (!finalconfig || !floating) {
+        warn_noalloc();
+        free(config);
+        free(finalconfig);
+        free(floating);
+        return;
+    }
+    memcpy(finalconfig, config, length);
     free(config);
+
+    /* floating pointer structure */
+    memset(floating, 0, sizeof(*floating));
+    floating->signature = MPTABLE_SIGNATURE;
+    floating->physaddr = (u32)finalconfig;
+    floating->length = 1;
+    floating->spec_rev = 4;
+    floating->checksum -= checksum(floating, sizeof(*floating));
+
+    dprintf(1, "MP table addr=%p MPC table addr=%p size=%d\n",
+            floating, finalconfig, length);
 }

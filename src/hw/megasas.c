@@ -16,8 +16,7 @@
 #include "config.h" // CONFIG_*
 #include "malloc.h" // free
 #include "output.h" // dprintf
-#include "pci.h" // pci_config_readl
-#include "pcidevice.h" // foreachpci
+#include "pci.h" // foreachpci
 #include "pci_ids.h" // PCI_DEVICE_ID_XXX
 #include "pci_regs.h" // PCI_VENDOR_ID
 #include "stacks.h" // yield
@@ -158,19 +157,17 @@ static int megasas_fire_cmd(u16 pci_id, u32 ioaddr,
 }
 
 int
-megasas_process_op(struct disk_op_s *op)
+megasas_cmd_data(struct disk_op_s *op, void *cdbcmd, u16 blocksize)
 {
-    if (!CONFIG_MEGASAS)
-        return DISK_RET_EBADTRACK;
-    u8 cdb[16];
-    int blocksize = scsi_fill_cmd(op, cdb, sizeof(cdb));
-    if (blocksize < 0)
-        return default_process_op(op);
     struct megasas_lun_s *mlun_gf =
         container_of(op->drive_gf, struct megasas_lun_s, drive);
+    u8 *cdb = cdbcmd;
     struct megasas_cmd_frame *frame = GET_GLOBALFLAT(mlun_gf->frame);
     u16 pci_id = GET_GLOBALFLAT(mlun_gf->pci_id);
     int i;
+
+    if (!CONFIG_MEGASAS)
+        return DISK_RET_EBADTRACK;
 
     memset_fl(frame, 0, sizeof(*frame));
     SET_LOWFLAT(frame->cmd, MFI_CMD_LD_SCSI_IO);
@@ -225,8 +222,9 @@ megasas_add_lun(struct pci_device *pci, u32 iobase, u8 target, u8 lun)
         free(mlun);
         return -1;
     }
-    name = znprintf(MAXDESCSIZE, "MegaRAID SAS (PCI %pP) LD %d:%d"
-                    , pci, target, lun);
+    name = znprintf(36, "MegaRAID SAS (PCI %02x:%02x.%x) LD %d:%d",
+                    pci_bdf_to_bus(pci->bdf), pci_bdf_to_dev(pci->bdf),
+                    pci_bdf_to_fn(pci->bdf), target, lun);
     prio = bootprio_find_scsi_device(pci, target, lun);
     ret = scsi_drive_setup(&mlun->drive, name, prio);
     free(name);
@@ -243,10 +241,7 @@ static void megasas_scan_target(struct pci_device *pci, u32 iobase)
 {
     struct mfi_ld_list_s ld_list;
     struct megasas_cmd_frame *frame = memalign_tmp(256, sizeof(*frame));
-    if (!frame) {
-        warn_noalloc();
-        return;
-    }
+    int i;
 
     memset(&ld_list, 0, sizeof(ld_list));
     memset_fl(frame, 0, sizeof(*frame));
@@ -263,7 +258,6 @@ static void megasas_scan_target(struct pci_device *pci, u32 iobase)
 
     if (megasas_fire_cmd(pci->device, iobase, frame) == 0) {
         dprintf(2, "%d LD found\n", ld_list.count);
-        int i;
         for (i = 0; i < ld_list.count; i++) {
             dprintf(2, "LD %d:%d state 0x%x\n",
                     ld_list.lds[i].target, ld_list.lds[i].lun,
@@ -301,9 +295,9 @@ static int megasas_transition_to_ready(struct pci_device *pci, u32 ioaddr)
                 pci->device == PCI_DEVICE_ID_LSI_SAS2008 ||
                 pci->device == PCI_DEVICE_ID_LSI_SAS2208 ||
                 pci->device == PCI_DEVICE_ID_LSI_SAS3108) {
-                outl(mfi_flags, ioaddr + MFI_DB);
+                outl(ioaddr + MFI_DB, mfi_flags);
             } else {
-                outl(mfi_flags, ioaddr + MFI_IDB);
+                outl(ioaddr + MFI_IDB, mfi_flags);
             }
             break;
         case MFI_STATE_OPERATIONAL:
@@ -312,7 +306,7 @@ static int megasas_transition_to_ready(struct pci_device *pci, u32 ioaddr)
                 pci->device == PCI_DEVICE_ID_LSI_SAS2008 ||
                 pci->device == PCI_DEVICE_ID_LSI_SAS2208 ||
                 pci->device == PCI_DEVICE_ID_LSI_SAS3108) {
-                outl(mfi_flags, ioaddr + MFI_DB);
+                outl(ioaddr + MFI_DB, mfi_flags);
                 if (pci->device == PCI_DEVICE_ID_LSI_SAS2208 ||
                     pci->device == PCI_DEVICE_ID_LSI_SAS3108) {
                     int j = 0;
@@ -327,7 +321,7 @@ static int megasas_transition_to_ready(struct pci_device *pci, u32 ioaddr)
                     }
                 }
             } else {
-                outl(mfi_flags, ioaddr + MFI_IDB);
+                outw(ioaddr + MFI_IDB, mfi_flags);
             }
             break;
         case MFI_STATE_READY:
@@ -357,22 +351,23 @@ static int megasas_transition_to_ready(struct pci_device *pci, u32 ioaddr)
 }
 
 static void
-init_megasas(void *data)
+init_megasas(struct pci_device *pci)
 {
-    struct pci_device *pci = data;
-    u32 bar = PCI_BASE_ADDRESS_2;
-    if (!(pci_config_readl(pci->bdf, bar) & PCI_BASE_ADDRESS_IO_MASK))
-        bar = PCI_BASE_ADDRESS_0;
-    u32 iobase = pci_enable_iobar(pci, bar);
-    if (!iobase)
-        return;
-    pci_enable_busmaster(pci);
+    u16 bdf = pci->bdf;
+    u32 iobase = pci_config_readl(pci->bdf, PCI_BASE_ADDRESS_2)
+        & PCI_BASE_ADDRESS_IO_MASK;
 
-    dprintf(1, "found MegaRAID SAS at %pP, io @ %x\n", pci, iobase);
+    dprintf(1, "found MegaRAID SAS at %02x:%02x.%x, io @ %x\n",
+            pci_bdf_to_bus(bdf), pci_bdf_to_dev(bdf),
+            pci_bdf_to_fn(bdf), iobase);
 
+    pci_config_maskw(pci->bdf, PCI_COMMAND, 0,
+                     PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
     // reset
     if (megasas_transition_to_ready(pci, iobase) == 0)
         megasas_scan_target(pci, iobase);
+
+    return;
 }
 
 void
@@ -400,6 +395,6 @@ megasas_setup(void)
             pci->device == PCI_DEVICE_ID_DELL_PERC5 ||
             pci->device == PCI_DEVICE_ID_LSI_SAS2208 ||
             pci->device == PCI_DEVICE_ID_LSI_SAS3108)
-            run_thread(init_megasas, pci);
+            init_megasas(pci);
     }
 }

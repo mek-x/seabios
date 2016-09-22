@@ -23,13 +23,8 @@
 #define ICH9_LPC_PIRQA_ROUT            0x60
 #define ICH9_LPC_PIRQE_ROUT            0x68
 #define ICH9_LPC_PIRQ_ROUT_IRQEN       0x80
-#define ICH9_LPC_GEN_PMCON_1           0xa0
-#define ICH9_LPC_GEN_PMCON_1_SMI_LOCK  (1 << 4)
 #define ICH9_LPC_PORT_ELCR1            0x4d0
 #define ICH9_LPC_PORT_ELCR2            0x4d1
-#define ICH9_LPC_RCBA                  0xf0
-#define ICH9_LPC_RCBA_ADDR             0xfed1c000
-#define ICH9_LPC_RCBA_EN               0x1
 #define PCI_DEVICE_ID_INTEL_ICH9_SMBUS 0x2930
 #define ICH9_SMB_SMB_BASE              0x20
 #define ICH9_SMB_HOSTC                 0x40
@@ -43,7 +38,6 @@
 #define ICH9_PMIO_GPE0_BLK_LEN         0x10
 #define ICH9_PMIO_SMI_EN               0x30
 #define ICH9_PMIO_SMI_EN_APMC_EN       (1 << 5)
-#define ICH9_PMIO_SMI_EN_GLB_SMI_EN    (1 << 0)
 
 /* FADT ACPI_ENABLE/ACPI_DISABLE */
 #define ICH9_APM_ACPI_ENABLE           0x2

@@ -1,314 +1,19 @@
 // Code for manipulating stack locations.
 //
-// Copyright (C) 2009-2015  Kevin O'Connor <kevin@koconnor.net>
+// Copyright (C) 2009-2010  Kevin O'Connor <kevin@koconnor.net>
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include "biosvar.h" // GET_GLOBAL
 #include "bregs.h" // CR0_PE
-#include "fw/paravirt.h" // PORT_SMI_CMD
 #include "hw/rtc.h" // rtc_use
 #include "list.h" // hlist_node
 #include "malloc.h" // free
 #include "output.h" // dprintf
-#include "romfile.h" // romfile_loadint
 #include "stacks.h" // struct mutex_s
-#include "string.h" // memset
 #include "util.h" // useRTC
 
 #define MAIN_STACK_MAX (1024*1024)
-
-
-/****************************************************************
- * 16bit / 32bit calling
- ****************************************************************/
-
-struct {
-    u8 method;
-    u8 cmosindex;
-    u8 a20;
-    u16 ss, fs, gs;
-    u32 cr0;
-    struct descloc_s gdt;
-} Call16Data VARLOW;
-
-#define C16_BIG 1
-#define C16_SMM 2
-
-int HaveSmmCall32 VARFSEG;
-
-// Backup state in preparation for call32
-static int
-call32_prep(u8 method)
-{
-    if (!CONFIG_CALL32_SMM || method != C16_SMM) {
-        // Backup cr0
-        u32 cr0 = cr0_read();
-        if (cr0 & CR0_PE)
-            // Called in 16bit protected mode?!
-            return -1;
-        SET_LOW(Call16Data.cr0, cr0);
-
-        // Backup fs/gs and gdt
-        SET_LOW(Call16Data.fs, GET_SEG(FS));
-        SET_LOW(Call16Data.gs, GET_SEG(GS));
-        struct descloc_s gdt;
-        sgdt(&gdt);
-        SET_LOW(Call16Data.gdt.length, gdt.length);
-        SET_LOW(Call16Data.gdt.addr, gdt.addr);
-
-        // Enable a20 and backup its previous state
-        SET_LOW(Call16Data.a20, set_a20(1));
-    }
-
-    // Backup ss
-    SET_LOW(Call16Data.ss, GET_SEG(SS));
-
-    // Backup cmos index register and disable nmi
-    u8 cmosindex = inb(PORT_CMOS_INDEX);
-    outb(cmosindex | NMI_DISABLE_BIT, PORT_CMOS_INDEX);
-    inb(PORT_CMOS_DATA);
-    SET_LOW(Call16Data.cmosindex, cmosindex);
-
-    SET_LOW(Call16Data.method, method);
-    return 0;
-}
-
-// Restore state backed up during call32
-static u8
-call32_post(void)
-{
-    u8 method = GET_LOW(Call16Data.method);
-    SET_LOW(Call16Data.method, 0);
-    SET_LOW(Call16Data.ss, 0);
-
-    if (!CONFIG_CALL32_SMM || method != C16_SMM) {
-        // Restore a20
-        set_a20(GET_LOW(Call16Data.a20));
-
-        // Restore gdt and fs/gs
-        struct descloc_s gdt;
-        gdt.length = GET_LOW(Call16Data.gdt.length);
-        gdt.addr = GET_LOW(Call16Data.gdt.addr);
-        lgdt(&gdt);
-        SET_SEG(FS, GET_LOW(Call16Data.fs));
-        SET_SEG(GS, GET_LOW(Call16Data.gs));
-
-        // Restore cr0
-        u32 cr0_caching = GET_LOW(Call16Data.cr0) & (CR0_CD|CR0_NW);
-        if (cr0_caching)
-            cr0_mask(CR0_CD|CR0_NW, cr0_caching);
-    }
-
-    // Restore cmos index register
-    outb(GET_LOW(Call16Data.cmosindex), PORT_CMOS_INDEX);
-    inb(PORT_CMOS_DATA);
-    return method;
-}
-
-// Force next call16() to restore to a pristine cpu environment state
-static void
-call16_override(int big)
-{
-    ASSERT32FLAT();
-    if (getesp() > BUILD_STACK_ADDR)
-        panic("call16_override with invalid stack\n");
-    memset(&Call16Data, 0, sizeof(Call16Data));
-    if (big) {
-        Call16Data.method = C16_BIG;
-        Call16Data.a20 = 1;
-    } else {
-        Call16Data.a20 = !CONFIG_DISABLE_A20;
-    }
-}
-
-// 16bit handler code called from call16() / call16_smm()
-u32 VISIBLE16
-call16_helper(u32 eax, u32 edx, u32 (*func)(u32 eax, u32 edx))
-{
-    u8 method = call32_post();
-    u32 ret = func(eax, edx);
-    call32_prep(method);
-    return ret;
-}
-
-#define ASM32_SWITCH16 "  .pushsection .text.32fseg." UNIQSEC "\n  .code16\n"
-#define ASM32_BACK32   "  .popsection\n  .code32\n"
-#define ASM16_SWITCH32 "  .code32\n"
-#define ASM16_BACK16   "  .code16gcc\n"
-
-// Call a SeaBIOS C function in 32bit mode using smm trampoline
-static u32
-call32_smm(void *func, u32 eax)
-{
-    ASSERT16();
-    dprintf(9, "call32_smm %p %x\n", func, eax);
-    call32_prep(C16_SMM);
-    u32 bkup_esp;
-    asm volatile(
-        // Backup esp / set esp to flat stack location
-        "  movl %%esp, %0\n"
-        "  movl %%ss, %%eax\n"
-        "  shll $4, %%eax\n"
-        "  addl %%eax, %%esp\n"
-
-        // Transition to 32bit mode, call func, return to 16bit
-        "  movl $" __stringify(CALL32SMM_CMDID) ", %%eax\n"
-        "  movl $" __stringify(CALL32SMM_ENTERID) ", %%ecx\n"
-        "  movl $(" __stringify(BUILD_BIOS_ADDR) " + 1f), %%ebx\n"
-        "  outb %%al, $" __stringify(PORT_SMI_CMD) "\n"
-        "  rep; nop\n"
-        "  hlt\n"
-
-        ASM16_SWITCH32
-        "1:movl %1, %%eax\n"
-        "  calll *%2\n"
-        "  movl %%eax, %1\n"
-
-        "  movl $" __stringify(CALL32SMM_CMDID) ", %%eax\n"
-        "  movl $" __stringify(CALL32SMM_RETURNID) ", %%ecx\n"
-        "  movl $2f, %%ebx\n"
-        "  outb %%al, $" __stringify(PORT_SMI_CMD) "\n"
-        "  rep; nop\n"
-        "  hlt\n"
-
-        // Restore esp
-        ASM16_BACK16
-        "2:movl %0, %%esp\n"
-        : "=&r" (bkup_esp), "+r" (eax)
-        : "r" (func)
-        : "eax", "ecx", "edx", "ebx", "cc", "memory");
-    call32_post();
-
-    dprintf(9, "call32_smm done %p %x\n", func, eax);
-    return eax;
-}
-
-static u32
-call16_smm(u32 eax, u32 edx, void *func)
-{
-    ASSERT32FLAT();
-    if (!CONFIG_CALL32_SMM)
-        return eax;
-    func -= BUILD_BIOS_ADDR;
-    dprintf(9, "call16_smm %p %x %x\n", func, eax, edx);
-    u32 stackoffset = Call16Data.ss << 4;
-    asm volatile(
-        // Restore esp
-        "  subl %0, %%esp\n"
-
-        // Transition to 16bit mode, call func, return to 32bit
-        "  movl $" __stringify(CALL32SMM_CMDID) ", %%eax\n"
-        "  movl $" __stringify(CALL32SMM_RETURNID) ", %%ecx\n"
-        "  movl $(1f - " __stringify(BUILD_BIOS_ADDR) "), %%ebx\n"
-        "  outb %%al, $" __stringify(PORT_SMI_CMD) "\n"
-        "  rep; nop\n"
-        "  hlt\n"
-
-        ASM32_SWITCH16
-        "1:movl %1, %%eax\n"
-        "  movl %3, %%ecx\n"
-        "  calll _cfunc16_call16_helper\n"
-        "  movl %%eax, %1\n"
-
-        "  movl $" __stringify(CALL32SMM_CMDID) ", %%eax\n"
-        "  movl $" __stringify(CALL32SMM_ENTERID) ", %%ecx\n"
-        "  movl $2f, %%ebx\n"
-        "  outb %%al, $" __stringify(PORT_SMI_CMD) "\n"
-        "  rep; nop\n"
-        "  hlt\n"
-
-        // Set esp to flat stack location
-        ASM32_BACK32
-        "2:addl %0, %%esp\n"
-        : "+r" (stackoffset), "+r" (eax), "+d" (edx)
-        : "r" (func)
-        : "eax", "ecx", "ebx", "cc", "memory");
-    return eax;
-}
-
-// Call a 32bit SeaBIOS function from a 16bit SeaBIOS function.
-u32 VISIBLE16
-__call32(void *func, u32 eax, u32 errret)
-{
-    ASSERT16();
-    if (CONFIG_CALL32_SMM && GET_GLOBAL(HaveSmmCall32))
-        return call32_smm(func, eax);
-    // Jump direclty to 32bit mode - this clobbers the 16bit segment
-    // selector registers.
-    int ret = call32_prep(C16_BIG);
-    if (ret)
-        return errret;
-    u32 bkup_ss, bkup_esp;
-    asm volatile(
-        // Backup ss/esp / set esp to flat stack location
-        "  movl %%ss, %0\n"
-        "  movl %%esp, %1\n"
-        "  shll $4, %0\n"
-        "  addl %0, %%esp\n"
-        "  shrl $4, %0\n"
-
-        // Transition to 32bit mode, call func, return to 16bit
-        "  movl $(" __stringify(BUILD_BIOS_ADDR) " + 1f), %%edx\n"
-        "  jmp transition32_nmi_off\n"
-        ASM16_SWITCH32
-        "1:calll *%3\n"
-        "  movl $2f, %%edx\n"
-        "  jmp transition16big\n"
-
-        // Restore ds/ss/esp
-        ASM16_BACK16
-        "2:movl %0, %%ds\n"
-        "  movl %0, %%ss\n"
-        "  movl %1, %%esp\n"
-        : "=&r" (bkup_ss), "=&r" (bkup_esp), "+a" (eax)
-        : "r" (func)
-        : "ecx", "edx", "cc", "memory");
-    call32_post();
-    return eax;
-}
-
-// Call a 16bit SeaBIOS function, restoring the mode from last call32().
-static u32
-call16(u32 eax, u32 edx, void *func)
-{
-    ASSERT32FLAT();
-    if (getesp() > MAIN_STACK_MAX)
-        panic("call16 with invalid stack\n");
-    if (CONFIG_CALL32_SMM && Call16Data.method == C16_SMM)
-        return call16_smm(eax, edx, func);
-
-    extern void transition16big(void);
-    extern void transition16(void);
-    void *thunk = transition16;
-    if (Call16Data.method == C16_BIG || in_post())
-        thunk = transition16big;
-    func -= BUILD_BIOS_ADDR;
-    u32 stackseg = Call16Data.ss;
-    asm volatile(
-        // Transition to 16bit mode
-        "  movl $(1f - " __stringify(BUILD_BIOS_ADDR) "), %%edx\n"
-        "  jmp *%%ecx\n"
-        // Setup ss/esp and call func
-        ASM32_SWITCH16
-        "1:movl %2, %%ecx\n"
-        "  shll $4, %2\n"
-        "  movw %%cx, %%ss\n"
-        "  subl %2, %%esp\n"
-        "  movw %%cx, %%ds\n"
-        "  movl %4, %%edx\n"
-        "  movl %3, %%ecx\n"
-        "  calll _cfunc16_call16_helper\n"
-        // Return to 32bit and restore esp
-        "  movl $2f, %%edx\n"
-        "  jmp transition32_nmi_off\n"
-        ASM32_BACK32
-        "2:addl %2, %%esp\n"
-        : "+a" (eax), "+c"(thunk), "+r"(stackseg)
-        : "r" (func), "r" (edx)
-        : "edx", "cc", "memory");
-    return eax;
-}
 
 
 /****************************************************************
@@ -320,7 +25,7 @@ u8 ExtraStack[BUILD_EXTRA_STACK_SIZE+1] VARLOW __aligned(8);
 u8 *StackPos VARLOW;
 
 // Test if currently on the extra stack
-int
+static inline int
 on_extra_stack(void)
 {
     return MODE16 && GET_SEG(SS) == SEG_LOW && getesp() > (u32)ExtraStack;
@@ -328,7 +33,7 @@ on_extra_stack(void)
 
 // Switch to the extra stack and call a function.
 u32
-__stack_hop(u32 eax, u32 edx, void *func)
+stack_hop(u32 eax, u32 edx, void *func)
 {
     if (on_extra_stack())
         return ((u32 (*)(u32, u32))func)(eax, edx);
@@ -361,11 +66,9 @@ __stack_hop(u32 eax, u32 edx, void *func)
 
 // Switch back to original caller's stack and call a function.
 u32
-__stack_hop_back(u32 eax, u32 edx, void *func)
+stack_hop_back(u32 eax, u32 edx, void *func)
 {
-    if (!MODESEGMENT)
-        return call16(eax, edx, func);
-    if (!MODE16 || !on_extra_stack())
+    if (!on_extra_stack())
         return ((u32 (*)(u32, u32))func)(eax, edx);
     ASSERT16();
     u16 bkup_ss;
@@ -396,6 +99,95 @@ __stack_hop_back(u32 eax, u32 edx, void *func)
 
 
 /****************************************************************
+ * 16bit / 32bit calling
+ ****************************************************************/
+
+u16 StackSeg VARLOW;
+
+// Call a 32bit SeaBIOS function from a 16bit SeaBIOS function.
+u32 VISIBLE16
+call32(void *func, u32 eax, u32 errret)
+{
+    ASSERT16();
+    u32 cr0 = getcr0();
+    if (cr0 & CR0_PE)
+        // Called in 16bit protected mode?!
+        return errret;
+
+    // Backup cmos index register and disable nmi
+    u8 cmosindex = inb(PORT_CMOS_INDEX);
+    outb(cmosindex | NMI_DISABLE_BIT, PORT_CMOS_INDEX);
+    inb(PORT_CMOS_DATA);
+
+    // Backup fs/gs and gdt
+    u16 fs = GET_SEG(FS), gs = GET_SEG(GS);
+    struct descloc_s gdt;
+    sgdt(&gdt);
+
+    u16 oldstackseg = GET_LOW(StackSeg);
+    SET_LOW(StackSeg, GET_SEG(SS));
+    u32 bkup_ss, bkup_esp;
+    asm volatile(
+        // Backup ss/esp / set esp to flat stack location
+        "  movl %%ss, %0\n"
+        "  movl %%esp, %1\n"
+        "  shll $4, %0\n"
+        "  addl %0, %%esp\n"
+        "  shrl $4, %0\n"
+
+        // Transition to 32bit mode, call func, return to 16bit
+        "  movl $(" __stringify(BUILD_BIOS_ADDR) " + 1f), %%edx\n"
+        "  jmp transition32\n"
+        "  .code32\n"
+        "1:calll *%3\n"
+        "  movl $2f, %%edx\n"
+        "  jmp transition16big\n"
+
+        // Restore ds/ss/esp
+        "  .code16gcc\n"
+        "2:movl %0, %%ds\n"
+        "  movl %0, %%ss\n"
+        "  movl %1, %%esp\n"
+        : "=&r" (bkup_ss), "=&r" (bkup_esp), "+a" (eax)
+        : "r" (func)
+        : "ecx", "edx", "cc", "memory");
+
+    SET_LOW(StackSeg, oldstackseg);
+
+    // Restore gdt and fs/gs
+    lgdt(&gdt);
+    SET_SEG(FS, fs);
+    SET_SEG(GS, gs);
+
+    // Restore cmos index register
+    outb(cmosindex, PORT_CMOS_INDEX);
+    inb(PORT_CMOS_DATA);
+    return eax;
+}
+
+// Call a 16bit SeaBIOS function from a 32bit SeaBIOS function.
+static inline u32
+call16(u32 eax, u32 edx, void *func)
+{
+    ASSERT32FLAT();
+    if (getesp() > MAIN_STACK_MAX)
+        panic("call16 with invalid stack\n");
+    extern u32 __call16(u32 eax, u32 edx, void *func);
+    return __call16(eax, edx, func - BUILD_BIOS_ADDR);
+}
+
+static inline u32
+call16big(u32 eax, u32 edx, void *func)
+{
+    ASSERT32FLAT();
+    if (getesp() > MAIN_STACK_MAX)
+        panic("call16big with invalid stack\n");
+    extern u32 __call16big(u32 eax, u32 edx, void *func);
+    return __call16big(eax, edx, func - BUILD_BIOS_ADDR);
+}
+
+
+/****************************************************************
  * External 16bit interface calling
  ****************************************************************/
 
@@ -403,11 +195,11 @@ __stack_hop_back(u32 eax, u32 edx, void *func)
 void VISIBLE16
 _farcall16(struct bregs *callregs, u16 callregseg)
 {
-    if (need_hop_back()) {
-        stack_hop_back(_farcall16, callregs, callregseg);
+    ASSERT16();
+    if (on_extra_stack()) {
+        stack_hop_back((u32)callregs, callregseg, _farcall16);
         return;
     }
-    ASSERT16();
     asm volatile(
         "calll __farcall16\n"
         : "+a" (callregs), "+m" (*callregs), "+d" (callregseg)
@@ -415,44 +207,34 @@ _farcall16(struct bregs *callregs, u16 callregseg)
         : "ebx", "ecx", "esi", "edi", "cc", "memory");
 }
 
-// Invoke external 16bit code.
-void
+inline void
 farcall16(struct bregs *callregs)
 {
-    call16_override(0);
-    _farcall16(callregs, 0);
+    if (MODE16) {
+        _farcall16(callregs, GET_SEG(SS));
+        return;
+    }
+    extern void _cfunc16__farcall16(void);
+    call16((u32)callregs - StackSeg * 16, StackSeg, _cfunc16__farcall16);
 }
 
-// Invoke external 16bit code in "big real" mode.
-void
+inline void
 farcall16big(struct bregs *callregs)
 {
-    call16_override(1);
-    _farcall16(callregs, 0);
+    extern void _cfunc16__farcall16(void);
+    call16big((u32)callregs - StackSeg * 16, StackSeg, _cfunc16__farcall16);
 }
 
 // Invoke a 16bit software interrupt.
-void
+inline void
 __call16_int(struct bregs *callregs, u16 offset)
 {
-    callregs->code.offset = offset;
-    if (!MODESEGMENT) {
+    if (MODESEGMENT)
+        callregs->code.seg = GET_SEG(CS);
+    else
         callregs->code.seg = SEG_BIOS;
-        _farcall16((void*)callregs - Call16Data.ss * 16, Call16Data.ss);
-        return;
-    }
-    callregs->code.seg = GET_SEG(CS);
-    _farcall16(callregs, GET_SEG(SS));
-}
-
-// Reset the machine
-void
-reset(void)
-{
-    extern void reset_vector(void) __noreturn;
-    if (!MODE16)
-        call16(0, 0, reset_vector);
-    reset_vector();
+    callregs->code.offset = offset;
+    farcall16(callregs);
 }
 
 
@@ -487,25 +269,6 @@ getCurThread(void)
     if (esp <= MAIN_STACK_MAX)
         return &MainThread;
     return (void*)ALIGN_DOWN(esp, THREADSTACKSIZE);
-}
-
-static u8 CanInterrupt, ThreadControl;
-
-// Initialize the support for internal threads.
-void
-thread_setup(void)
-{
-    CanInterrupt = 1;
-    if (! CONFIG_THREADS)
-        return;
-    ThreadControl = romfile_loadint("etc/threads", 1);
-}
-
-// Should hardware initialization threads run during optionrom execution.
-int
-threads_during_optionroms(void)
-{
-    return CONFIG_THREADS && CONFIG_RTC_TIMER && ThreadControl == 2 && in_post();
 }
 
 // Switch to next thread stack.
@@ -546,7 +309,7 @@ void
 run_thread(void (*func)(void*), void *data)
 {
     ASSERT32FLAT();
-    if (! CONFIG_THREADS || ! ThreadControl)
+    if (! CONFIG_THREADS)
         goto fail;
     struct thread_info *thread;
     thread = memalign_tmphigh(THREADSTACKSIZE, THREADSTACKSIZE);
@@ -592,17 +355,10 @@ fail:
 void VISIBLE16
 check_irqs(void)
 {
-    if (!MODESEGMENT && !CanInterrupt) {
-        // Can't enable interrupts (PIC and/or IVT not yet setup)
-        cpu_relax();
+    if (on_extra_stack()) {
+        stack_hop_back(0, 0, check_irqs);
         return;
     }
-    if (need_hop_back()) {
-        stack_hop_back(check_irqs, 0, 0);
-        return;
-    }
-    if (MODE16)
-        clock_poll_irq();
     asm volatile("sti ; nop ; rep ; nop ; cli ; cld" : : :"memory");
 }
 
@@ -610,14 +366,19 @@ check_irqs(void)
 void
 yield(void)
 {
-    if (MODESEGMENT || !CONFIG_THREADS) {
+    if (MODESEGMENT) {
         check_irqs();
+        return;
+    }
+    extern void _cfunc16_check_irqs(void);
+    if (!CONFIG_THREADS) {
+        call16big(0, 0, _cfunc16_check_irqs);
         return;
     }
     struct thread_info *cur = getCurThread();
     if (cur == &MainThread)
         // Permit irqs to fire
-        check_irqs();
+        call16big(0, 0, _cfunc16_check_irqs);
 
     // Switch to the next thread
     switch_next(cur);
@@ -626,8 +387,8 @@ yield(void)
 void VISIBLE16
 wait_irq(void)
 {
-    if (need_hop_back()) {
-        stack_hop_back(wait_irq, 0, 0);
+    if (on_extra_stack()) {
+        stack_hop_back(0, 0, wait_irq);
         return;
     }
     asm volatile("sti ; hlt ; cli ; cld": : :"memory");
@@ -637,13 +398,17 @@ wait_irq(void)
 void
 yield_toirq(void)
 {
-    if (!CONFIG_HARDWARE_IRQ
-        || (!MODESEGMENT && (have_threads() || !CanInterrupt))) {
-        // Threads still active or irqs not available - do a yield instead.
+    if (MODESEGMENT) {
+        wait_irq();
+        return;
+    }
+    if (have_threads()) {
+        // Threads still active - do a yield instead.
         yield();
         return;
     }
-    wait_irq();
+    extern void _cfunc16_wait_irq(void);
+    call16big(0, 0, _cfunc16_wait_irq);
 }
 
 // Wait for all threads (other than the main thread) to complete.
@@ -687,7 +452,7 @@ static u32 PreemptCount;
 void
 start_preempt(void)
 {
-    if (! threads_during_optionroms())
+    if (! CONFIG_THREAD_OPTIONROMS)
         return;
     CanPreempt = 1;
     PreemptCount = 0;
@@ -698,7 +463,7 @@ start_preempt(void)
 void
 finish_preempt(void)
 {
-    if (! threads_during_optionroms()) {
+    if (! CONFIG_THREAD_OPTIONROMS) {
         yield();
         return;
     }
@@ -712,7 +477,7 @@ finish_preempt(void)
 int
 wait_preempt(void)
 {
-    if (MODESEGMENT || !CONFIG_THREADS || !CanPreempt
+    if (MODESEGMENT || !CONFIG_THREAD_OPTIONROMS || !CanPreempt
         || getesp() < MAIN_STACK_MAX)
         return 0;
     while (CanPreempt)
@@ -732,8 +497,9 @@ yield_preempt(void)
 void
 check_preempt(void)
 {
-    if (CONFIG_THREADS && GET_GLOBAL(CanPreempt) && have_threads())
-        call32(yield_preempt, 0, 0);
+    extern void _cfunc32flat_yield_preempt(void);
+    if (CONFIG_THREAD_OPTIONROMS && GET_GLOBAL(CanPreempt) && have_threads())
+        call32(_cfunc32flat_yield_preempt, 0, 0);
 }
 
 
@@ -754,10 +520,11 @@ call32_params_helper(struct call32_params_s *params)
 }
 
 u32
-__call32_params(void *func, u32 eax, u32 edx, u32 ecx, u32 errret)
+call32_params(void *func, u32 eax, u32 edx, u32 ecx, u32 errret)
 {
     ASSERT16();
     struct call32_params_s params = {func, eax, edx, ecx};
-    return call32(call32_params_helper, MAKE_FLATPTR(GET_SEG(SS), &params)
-                  , errret);
+    extern void _cfunc32flat_call32_params_helper(void);
+    return call32(_cfunc32flat_call32_params_helper
+                  , (u32)MAKE_FLATPTR(GET_SEG(SS), &params), errret);
 }

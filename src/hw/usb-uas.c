@@ -91,7 +91,7 @@ struct uasdrive_s {
 };
 
 int
-uas_process_op(struct disk_op_s *op)
+uas_cmd_data(struct disk_op_s *op, void *cdbcmd, u16 blocksize)
 {
     if (!CONFIG_USB_UAS)
         return DISK_RET_EBADTRACK;
@@ -104,9 +104,7 @@ uas_process_op(struct disk_op_s *op)
     ui.hdr.id = UAS_UI_COMMAND;
     ui.hdr.tag = 0xdead;
     ui.command.lun[1] = GET_GLOBALFLAT(drive_gf->lun);
-    int blocksize = scsi_fill_cmd(op, ui.command.cdb, sizeof(ui.command.cdb));
-    if (blocksize < 0)
-        return default_process_op(op);
+    memcpy(ui.command.cdb, cdbcmd, sizeof(ui.command.cdb));
     int ret = usb_send_bulk(GET_GLOBALFLAT(drive_gf->command),
                             USB_DIR_OUT, MAKE_FLATPTR(GET_SEG(SS), &ui),
                             sizeof(ui.hdr) + sizeof(ui.command));
@@ -268,9 +266,9 @@ usb_uas_setup(struct usbdevice_s *usbdev)
     return 0;
 
 fail:
-    usb_free_pipe(usbdev, command);
-    usb_free_pipe(usbdev, status);
-    usb_free_pipe(usbdev, data_in);
-    usb_free_pipe(usbdev, data_out);
+    free_pipe(command);
+    free_pipe(status);
+    free_pipe(data_in);
+    free_pipe(data_out);
     return -1;
 }

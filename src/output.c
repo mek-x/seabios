@@ -1,6 +1,7 @@
 // Raw screen writing and debug output code.
 //
 // Copyright (C) 2008-2013  Kevin O'Connor <kevin@koconnor.net>
+// Copyright (C) 2013 Sage Electronic Engineering, LLC
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
@@ -10,8 +11,6 @@
 #include "bregs.h" // struct bregs
 #include "config.h" // CONFIG_*
 #include "biosvar.h" // GET_GLOBAL
-#include "hw/pci.h" // pci_bdf_to_bus
-#include "hw/pcidevice.h" // pci_device
 #include "hw/serialio.h" // serial_debug_putc
 #include "malloc.h" // malloc_tmp
 #include "output.h" // dprintf
@@ -23,7 +22,6 @@ struct putcinfo {
     void (*func)(struct putcinfo *info, char c);
 };
 
-
 /****************************************************************
  * Debug output
  ****************************************************************/
@@ -32,7 +30,6 @@ void
 debug_banner(void)
 {
     dprintf(1, "SeaBIOS (version %s)\n", VERSION);
-    dprintf(3, "BUILD: %s\n", BUILDINFO);
 }
 
 // Write a character to debug port(s).
@@ -79,7 +76,6 @@ screenc(char c)
     br.flags = F_IF;
     br.ah = 0x0e;
     br.al = c;
-    br.bl = 0x07;
     call16_int(0x10, &br);
 }
 
@@ -196,17 +192,6 @@ putprettyhex(struct putcinfo *action, u32 val, int width, char padchar)
     puthex(action, val, count);
 }
 
-// Output 'struct pci_device' BDF as %02x:%02x.%x
-static void
-put_pci_device(struct putcinfo *action, struct pci_device *pci)
-{
-    puthex(action, pci_bdf_to_bus(pci->bdf), 2);
-    putc(action, ':');
-    puthex(action, pci_bdf_to_dev(pci->bdf), 2);
-    putc(action, '.');
-    puthex(action, pci_bdf_to_fn(pci->bdf), 1);
-}
-
 static inline int
 isdigit(u8 c)
 {
@@ -273,12 +258,6 @@ bvprintf(struct putcinfo *action, const char *fmt, va_list args)
             break;
         case 'p':
             val = va_arg(args, s32);
-            if (!MODESEGMENT && GET_GLOBAL(*(u8*)(n+1)) == 'P') {
-                // %pP is 'struct pci_device' printer
-                put_pci_device(action, (void*)val);
-                n++;
-                break;
-            }
             putc(action, '0');
             putc(action, 'x');
             puthex(action, val, 8);

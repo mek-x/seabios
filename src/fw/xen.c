@@ -4,17 +4,16 @@
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
-#include "config.h" // CONFIG_XEN
-#include "e820map.h" // e820_add
+#include "config.h"
 #include "hw/serialio.h" // DebugOutputPort
 #include "malloc.h" // memalign_high
-#include "memmap.h" // PAGE_SIZE
+#include "memmap.h" // add_e820
 #include "output.h" // dprintf
 #include "paravirt.h" // PlatformRunningOn
 #include "string.h" // memcpy
 #include "util.h" // copy_acpi_rsdp
 #include "x86.h" // cpuid
-#include "xen.h" // xen_extraversion_t
+#include "xen.h"
 
 #define INFO_PHYSICAL_ADDRESS 0x00001000
 
@@ -71,7 +70,6 @@ void xen_preinit(void)
                 signature, base);
         if (strcmp(signature, "XenVMMXenVMM") == 0) {
             /* Set debug_io_port first, so the following messages work. */
-            code_mutable_preinit();
             DebugOutputPort = 0xe9;
             debug_banner();
             dprintf(1, "\nFound Xen hypervisor signature at %x\n", base);
@@ -144,6 +142,6 @@ void xen_ramsize_preinit(void)
 
     for (i = 0; i < info->e820_nr; i++) {
         struct e820entry *e = &e820[i];
-        e820_add(e->start, e->size, e->type);
+        add_e820(e->start, e->size, e->type);
     }
 }

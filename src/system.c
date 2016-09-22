@@ -7,13 +7,29 @@
 
 #include "biosvar.h" // GET_GLOBAL
 #include "bregs.h" // struct bregs
-#include "e820map.h" // E820_RAM
 #include "hw/pic.h" // pic_reset
+#include "hw/ps2port.h" // PORT_A20
 #include "malloc.h" // LegacyRamSize
+#include "memmap.h" // E820_RAM
 #include "output.h" // debug_enter
 #include "string.h" // memcpy_far
 #include "util.h" // handle_1553
-#include "x86.h" // set_a20
+#include "x86.h" // inb
+
+// Use PS2 System Control port A to set A20 enable
+static inline u8
+set_a20(u8 cond)
+{
+    // get current setting first
+    u8 newval, oldval = inb(PORT_A20);
+    if (cond)
+        newval = oldval | A20_ENABLE_BIT;
+    else
+        newval = oldval & ~A20_ENABLE_BIT;
+    outb(newval, PORT_A20);
+
+    return (oldval & A20_ENABLE_BIT) != 0;
+}
 
 static void
 handle_152400(struct bregs *regs)
@@ -32,7 +48,7 @@ handle_152401(struct bregs *regs)
 static void
 handle_152402(struct bregs *regs)
 {
-    regs->al = get_a20();
+    regs->al = (inb(PORT_A20) & A20_ENABLE_BIT) != 0;
     set_code_success(regs);
 }
 
@@ -92,25 +108,24 @@ handle_1587(struct bregs *regs)
 // check for access rights of source & dest here
 
     // Initialize GDT descriptor
-    u64 *gdt_far = (void*)(regs->si + 0);
+    u32 si = regs->si;
+    u64 *gdt_far = (void*)si;
     u16 gdt_seg = regs->es;
     u32 loc = (u32)MAKE_FLATPTR(gdt_seg, gdt_far);
     SET_FARVAR(gdt_seg, gdt_far[1], GDT_DATA | GDT_LIMIT((6*sizeof(u64))-1)
                | GDT_BASE(loc));
     // Initialize CS descriptor
-    u64 lim = GDT_LIMIT(0x0ffff);
-    if (in_post())
-        lim = GDT_GRANLIMIT(0xffffffff);
-    SET_FARVAR(gdt_seg, gdt_far[4], GDT_CODE | lim | GDT_BASE(BUILD_BIOS_ADDR));
+    SET_FARVAR(gdt_seg, gdt_far[4], GDT_CODE | GDT_LIMIT(BUILD_BIOS_SIZE-1)
+               | GDT_BASE(BUILD_BIOS_ADDR));
     // Initialize SS descriptor
     loc = (u32)MAKE_FLATPTR(GET_SEG(SS), 0);
-    SET_FARVAR(gdt_seg, gdt_far[5], GDT_DATA | lim | GDT_BASE(loc));
+    SET_FARVAR(gdt_seg, gdt_far[5], GDT_DATA | GDT_LIMIT(0x0ffff)
+               | GDT_BASE(loc));
 
-    SET_SEG(ES, gdt_seg);
-    u16 count = regs->cx, si = 0, di = 0;
+    u16 count = regs->cx;
     asm volatile(
         // Load new descriptor tables
-        "  lgdtw %%es:(1<<3)(%%eax)\n"
+        "  lgdtw %%es:(1<<3)(%%si)\n"
         "  lidtw %%cs:pmode_IDT_info\n"
 
         // Enable protected mode
@@ -127,14 +142,13 @@ handle_1587(struct bregs *regs)
         "  movw $(3<<3), %%ax\n" // 3rd descriptor in table, TI=GDT, RPL=00
         "  movw %%ax, %%es\n"
 
-        // memcpy CX words using 32bit memcpy if applicable
-        "  testw $1, %%cx\n"
-        "  jnz 3f\n"
-        "  shrw $1, %%cx\n"
-        "  rep movsl %%ds:(%%si), %%es:(%%di)\n"
+        // move CX words from DS:SI to ES:DI
+        "  xorw %%si, %%si\n"
+        "  xorw %%di, %%di\n"
+        "  rep movsw\n"
 
         // Restore DS and ES segment limits to 0xffff
-        "2:movw $(5<<3), %%ax\n" // 5th descriptor in table (SS)
+        "  movw $(5<<3), %%ax\n" // 5th descriptor in table (SS)
         "  movw %%ax, %%ds\n"
         "  movw %%ax, %%es\n"
 
@@ -144,21 +158,16 @@ handle_1587(struct bregs *regs)
         "  movl %%eax, %%cr0\n"
 
         // far jump to flush CPU queue after transition to real mode
-        "  ljmpw $" __stringify(SEG_BIOS) ", $4f\n"
-
-        // Slower 16bit copy method
-        "3:rep movsw %%ds:(%%si), %%es:(%%di)\n"
-        "  jmp 2b\n"
+        "  ljmpw $" __stringify(SEG_BIOS) ", $2f\n"
 
         // restore IDT to normal real-mode defaults
-        "4:lidtw %%cs:rmode_IDT_info\n"
+        "2:lidtw %%cs:rmode_IDT_info\n"
 
         // Restore %ds (from %ss)
         "  movw %%ss, %%ax\n"
         "  movw %%ax, %%ds\n"
-        : "+a" (gdt_far), "+c"(count), "+m" (__segment_ES)
-        : "S" (si), "D" (di)
-        : "cc");
+        : "+c"(count), "+S"(si), "+m" (__segment_ES)
+        : : "eax", "di", "cc");
 
     set_a20(prev_a20_enable);
 
@@ -181,10 +190,9 @@ handle_1588(struct bregs *regs)
 }
 
 // Switch to protected mode
-void VISIBLE16
+static void
 handle_1589(struct bregs *regs)
 {
-    debug_enter(regs, DEBUG_HDL_15);
     set_a20(1);
 
     pic_reset(regs->bl, regs->bh);
@@ -337,6 +345,7 @@ handle_15(struct bregs *regs)
     debug_enter(regs, DEBUG_HDL_15);
     switch (regs->ah) {
     case 0x24: handle_1524(regs); break;
+    case 0x4e: handle_154e(regs); break;
     case 0x4f: handle_154f(regs); break;
     case 0x52: handle_1552(regs); break;
     case 0x53: handle_1553(regs); break;
@@ -346,6 +355,7 @@ handle_15(struct bregs *regs)
     case 0x86: handle_1586(regs); break;
     case 0x87: handle_1587(regs); break;
     case 0x88: handle_1588(regs); break;
+    case 0x89: handle_1589(regs); break;
     case 0x90: handle_1590(regs); break;
     case 0x91: handle_1591(regs); break;
     case 0xc0: handle_15c0(regs); break;

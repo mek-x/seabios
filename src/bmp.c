@@ -1,6 +1,6 @@
 /*
 * Basic BMP data process and Raw picture data handle functions.
-* Could be used to adjust pixel data format, get information, etc.
+* Could be used to adjust pixel data format, get infomation, etc.
 *
 * Copyright (C) 2011 Wayne Xia <xiawenc@cn.ibm.com>
 *

@@ -1,5 +1,4 @@
 // Support for generating ACPI tables (on emulators)
-// DO NOT ADD NEW FEATURES HERE.  (See paravirt.c / biostables.c instead.)
 //
 // Copyright (C) 2008-2010  Kevin O'Connor <kevin@koconnor.net>
 // Copyright (C) 2006 Fabrice Bellard
@@ -9,8 +8,7 @@
 #include "byteorder.h" // cpu_to_le16
 #include "config.h" // CONFIG_*
 #include "dev-q35.h"
-#include "dev-piix.h"
-#include "hw/pcidevice.h" // pci_find_init_device
+#include "hw/pci.h" // pci_find_init_device
 #include "hw/pci_ids.h" // PCI_VENDOR_ID_INTEL
 #include "hw/pci_regs.h" // PCI_INTERRUPT_LINE
 #include "malloc.h" // free
@@ -21,8 +19,11 @@
 #include "string.h" // memset
 #include "util.h" // MaxCountCPUs
 #include "x86.h" // readl
+#include "romfile_loader.h" // romfile_loader_execute
 
-#include "fw/acpi-dsdt.hex"
+#include "src/fw/acpi-dsdt.hex"
+
+u32 acpi_pm1a_cnt VARFSEG;
 
 static void
 build_header(struct acpi_table_header *h, u32 sig, int len, u8 rev)
@@ -39,35 +40,40 @@ build_header(struct acpi_table_header *h, u32 sig, int len, u8 rev)
     h->checksum -= checksum(h, len);
 }
 
+#define PIIX4_ACPI_ENABLE       0xf1
+#define PIIX4_ACPI_DISABLE      0xf0
+#define PIIX4_GPE0_BLK          0xafe0
+#define PIIX4_GPE0_BLK_LEN      4
+
+#define PIIX4_PM_INTRRUPT       9       // irq 9
+
 static void piix4_fadt_setup(struct pci_device *pci, void *arg)
 {
     struct fadt_descriptor_rev1 *fadt = arg;
 
     fadt->model = 1;
     fadt->reserved1 = 0;
-    fadt->sci_int = cpu_to_le16(PIIX_PM_INTRRUPT);
+    fadt->sci_int = cpu_to_le16(PIIX4_PM_INTRRUPT);
     fadt->smi_cmd = cpu_to_le32(PORT_SMI_CMD);
-    fadt->acpi_enable = PIIX_ACPI_ENABLE;
-    fadt->acpi_disable = PIIX_ACPI_DISABLE;
-    fadt->pm1a_evt_blk = cpu_to_le32(acpi_pm_base);
-    fadt->pm1a_cnt_blk = cpu_to_le32(acpi_pm_base + 0x04);
-    fadt->pm_tmr_blk = cpu_to_le32(acpi_pm_base + 0x08);
-    fadt->gpe0_blk = cpu_to_le32(PIIX_GPE0_BLK);
+    fadt->acpi_enable = PIIX4_ACPI_ENABLE;
+    fadt->acpi_disable = PIIX4_ACPI_DISABLE;
+    fadt->pm1a_evt_blk = cpu_to_le32(PORT_ACPI_PM_BASE);
+    fadt->pm1a_cnt_blk = cpu_to_le32(PORT_ACPI_PM_BASE + 0x04);
+    fadt->pm_tmr_blk = cpu_to_le32(PORT_ACPI_PM_BASE + 0x08);
+    fadt->gpe0_blk = cpu_to_le32(PIIX4_GPE0_BLK);
     fadt->pm1_evt_len = 4;
     fadt->pm1_cnt_len = 2;
     fadt->pm_tmr_len = 4;
-    fadt->gpe0_blk_len = PIIX_GPE0_BLK_LEN;
+    fadt->gpe0_blk_len = PIIX4_GPE0_BLK_LEN;
     fadt->plvl2_lat = cpu_to_le16(0xfff); // C2 state not supported
     fadt->plvl3_lat = cpu_to_le16(0xfff); // C3 state not supported
-    fadt->flags = cpu_to_le32(ACPI_FADT_F_WBINVD |
-                              ACPI_FADT_F_PROC_C1 |
-                              ACPI_FADT_F_SLP_BUTTON |
-                              ACPI_FADT_F_RTC_S4 |
-                              ACPI_FADT_F_USE_PLATFORM_CLOCK);
+    /* WBINVD + PROC_C1 + SLP_BUTTON + RTC_S4 + USE_PLATFORM_CLOCK */
+    fadt->flags = cpu_to_le32((1 << 0) | (1 << 2) | (1 << 5) | (1 << 7) |
+                              (1 << 15));
 }
 
 /* PCI_VENDOR_ID_INTEL && PCI_DEVICE_ID_INTEL_ICH9_LPC */
-static void ich9_lpc_fadt_setup(struct pci_device *dev, void *arg)
+void ich9_lpc_fadt_setup(struct pci_device *dev, void *arg)
 {
     struct fadt_descriptor_rev1 *fadt = arg;
 
@@ -77,21 +83,19 @@ static void ich9_lpc_fadt_setup(struct pci_device *dev, void *arg)
     fadt->smi_cmd = cpu_to_le32(PORT_SMI_CMD);
     fadt->acpi_enable = ICH9_ACPI_ENABLE;
     fadt->acpi_disable = ICH9_ACPI_DISABLE;
-    fadt->pm1a_evt_blk = cpu_to_le32(acpi_pm_base);
-    fadt->pm1a_cnt_blk = cpu_to_le32(acpi_pm_base + 0x04);
-    fadt->pm_tmr_blk = cpu_to_le32(acpi_pm_base + 0x08);
-    fadt->gpe0_blk = cpu_to_le32(acpi_pm_base + ICH9_PMIO_GPE0_STS);
+    fadt->pm1a_evt_blk = cpu_to_le32(PORT_ACPI_PM_BASE);
+    fadt->pm1a_cnt_blk = cpu_to_le32(PORT_ACPI_PM_BASE + 0x04);
+    fadt->pm_tmr_blk = cpu_to_le32(PORT_ACPI_PM_BASE + 0x08);
+    fadt->gpe0_blk = cpu_to_le32(PORT_ACPI_PM_BASE + ICH9_PMIO_GPE0_STS);
     fadt->pm1_evt_len = 4;
     fadt->pm1_cnt_len = 2;
     fadt->pm_tmr_len = 4;
     fadt->gpe0_blk_len = ICH9_PMIO_GPE0_BLK_LEN;
     fadt->plvl2_lat = cpu_to_le16(0xfff); // C2 state not supported
     fadt->plvl3_lat = cpu_to_le16(0xfff); // C3 state not supported
-    fadt->flags = cpu_to_le32(ACPI_FADT_F_WBINVD |
-                              ACPI_FADT_F_PROC_C1 |
-                              ACPI_FADT_F_SLP_BUTTON |
-                              ACPI_FADT_F_RTC_S4 |
-                              ACPI_FADT_F_USE_PLATFORM_CLOCK);
+    /* WBINVD + PROC_C1 + SLP_BUTTON + RTC_S4 + USE_PLATFORM_CLOCK */
+    fadt->flags = cpu_to_le32((1 << 0) | (1 << 2) | (1 << 5) | (1 << 7) |
+                              (1 << 15));
 }
 
 static const struct pci_device_id fadt_init_tbl[] = {
@@ -235,7 +239,7 @@ encodeLen(u8 *ssdt_ptr, int length, int bytes)
     return ssdt_ptr + bytes;
 }
 
-#include "fw/ssdt-proc.hex"
+#include "src/fw/ssdt-proc.hex"
 
 /* 0x5B 0x83 ProcessorOp PkgLength NameString ProcID */
 #define PROC_OFFSET_CPUHEX (*ssdt_proc_name - *ssdt_proc_start + 2)
@@ -256,8 +260,8 @@ encodeLen(u8 *ssdt_ptr, int length, int bytes)
 #define SSDT_SIGNATURE 0x54445353 // SSDT
 #define SSDT_HEADER_LENGTH 36
 
-#include "fw/ssdt-misc.hex"
-#include "fw/ssdt-pcihp.hex"
+#include "src/fw/ssdt-misc.hex"
+#include "src/fw/ssdt-pcihp.hex"
 
 #define PCI_RMV_BASE 0xae0c
 
@@ -588,10 +592,32 @@ static const struct pci_device_id acpi_find_tbl[] = {
     PCI_DEVICE_END,
 };
 
+struct rsdp_descriptor *RsdpAddr;
+
 #define MAX_ACPI_TABLES 20
 void
 acpi_setup(void)
 {
+    if (CONFIG_FW_ROMFILE_LOAD) {
+        int loader_err;
+
+        dprintf(3, "load ACPI tables\n");
+
+        loader_err = romfile_loader_execute("etc/table-loader");
+
+        RsdpAddr = find_acpi_rsdp();
+
+        if (RsdpAddr)
+            return;
+
+        /* If present, loader should have installed an RSDP.
+         * Not installed? We might still be able to continue
+         * using the builtin RSDP.
+         */
+        if (!loader_err)
+            warn_internalerror();
+    }
+
     if (! CONFIG_ACPI)
         return;
 
@@ -675,11 +701,118 @@ acpi_setup(void)
     build_header((void*)rsdt, RSDT_SIGNATURE, rsdt_len, 1);
 
     // Build rsdp pointer table
-    struct rsdp_descriptor rsdp;
-    memset(&rsdp, 0, sizeof(rsdp));
-    rsdp.signature = cpu_to_le64(RSDP_SIGNATURE);
-    memcpy(rsdp.oem_id, BUILD_APPNAME6, 6);
-    rsdp.rsdt_physical_address = cpu_to_le32((u32)rsdt);
-    rsdp.checksum -= checksum(&rsdp, 20);
-    copy_acpi_rsdp(&rsdp);
+    struct rsdp_descriptor *rsdp = malloc_fseg(sizeof(*rsdp));
+    if (!rsdp) {
+        warn_noalloc();
+        return;
+    }
+    memset(rsdp, 0, sizeof(*rsdp));
+    rsdp->signature = cpu_to_le64(RSDP_SIGNATURE);
+    memcpy(rsdp->oem_id, BUILD_APPNAME6, 6);
+    rsdp->rsdt_physical_address = cpu_to_le32((u32)rsdt);
+    rsdp->checksum -= checksum(rsdp, 20);
+    RsdpAddr = rsdp;
+    dprintf(1, "ACPI tables: RSDP=%p RSDT=%p\n", rsdp, rsdt);
+}
+
+static struct fadt_descriptor_rev1 *
+find_fadt(void)
+{
+    dprintf(4, "rsdp=%p\n", RsdpAddr);
+    if (!RsdpAddr || RsdpAddr->signature != RSDP_SIGNATURE)
+        return NULL;
+    struct rsdt_descriptor_rev1 *rsdt = (void*)RsdpAddr->rsdt_physical_address;
+    dprintf(4, "rsdt=%p\n", rsdt);
+    if (!rsdt || rsdt->signature != RSDT_SIGNATURE)
+        return NULL;
+    void *end = (void*)rsdt + rsdt->length;
+    int i;
+    for (i=0; (void*)&rsdt->table_offset_entry[i] < end; i++) {
+        struct fadt_descriptor_rev1 *fadt = (void*)rsdt->table_offset_entry[i];
+        if (!fadt || fadt->signature != FACP_SIGNATURE)
+            continue;
+        dprintf(4, "fadt=%p\n", fadt);
+        return fadt;
+    }
+    dprintf(4, "no fadt found\n");
+    return NULL;
+}
+
+u32
+find_resume_vector(void)
+{
+    struct fadt_descriptor_rev1 *fadt = find_fadt();
+    if (!fadt)
+        return 0;
+    struct facs_descriptor_rev1 *facs = (void*)fadt->firmware_ctrl;
+    dprintf(4, "facs=%p\n", facs);
+    if (! facs || facs->signature != FACS_SIGNATURE)
+        return 0;
+    // Found it.
+    dprintf(4, "resume addr=%d\n", facs->firmware_waking_vector);
+    return facs->firmware_waking_vector;
+}
+
+void
+find_acpi_features(void)
+{
+    struct fadt_descriptor_rev1 *fadt = find_fadt();
+    if (!fadt)
+        return;
+    u32 pm_tmr = le32_to_cpu(fadt->pm_tmr_blk);
+    u32 pm1a_cnt = le32_to_cpu(fadt->pm1a_cnt_blk);
+    dprintf(4, "pm_tmr_blk=%x\n", pm_tmr);
+    if (pm_tmr)
+        pmtimer_setup(pm_tmr);
+    if (pm1a_cnt)
+        acpi_pm1a_cnt = pm1a_cnt;
+
+    // Theoretically we should check the 'reset_reg_sup' flag, but Windows
+    // doesn't and thus nobody seems to *set* it. If the table is large enough
+    // to include it, let the sanity checks in acpi_set_reset_reg() suffice.
+    if (fadt->length >= 129) {
+        void *p = fadt;
+        acpi_set_reset_reg(p + 116, *(u8 *)(p + 128));
+    }
+}
+
+static struct acpi_20_generic_address acpi_reset_reg;
+static u8 acpi_reset_val;
+
+#define acpi_ga_to_bdf(addr) pci_to_bdf(0, (addr >> 32) & 0xffff, (addr >> 16) & 0xffff)
+
+void
+acpi_reboot(void)
+{
+    // Check it passed the sanity checks in acpi_set_reset_reg() and was set
+    if (acpi_reset_reg.register_bit_width != 8)
+        return;
+
+    u64 addr = le64_to_cpu(acpi_reset_reg.address);
+
+    dprintf(1, "ACPI hard reset %d:%llx (%x)\n",
+            acpi_reset_reg.address_space_id, addr, acpi_reset_val);
+
+    switch (acpi_reset_reg.address_space_id) {
+    case 0: // System Memory
+	writeb((void *)(u32)addr, acpi_reset_val);
+        break;
+    case 1: // System I/O
+        outb(acpi_reset_val, addr);
+        break;
+    case 2: // PCI config space
+        pci_config_writeb(acpi_ga_to_bdf(addr), addr & 0xffff, acpi_reset_val);
+        break;
+    }
+}
+
+void
+acpi_set_reset_reg(struct acpi_20_generic_address *reg, u8 val)
+{
+    if (!reg || reg->address_space_id > 2 ||
+        reg->register_bit_width != 8 || reg->register_bit_offset)
+        return;
+
+    acpi_reset_reg = *reg;
+    acpi_reset_val = val;
 }

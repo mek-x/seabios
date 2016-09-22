@@ -11,7 +11,7 @@
 #include "config.h" // CONFIG_FLOPPY
 #include "malloc.h" // malloc_fseg
 #include "output.h" // dprintf
-#include "pcidevice.h" // pci_find_class
+#include "pci.h" // pci_to_bdf
 #include "pci_ids.h" // PCI_CLASS_BRIDGE_ISA
 #include "pic.h" // pic_eoi1
 #include "romfile.h" // romfile_loadint
@@ -57,6 +57,8 @@ struct floppy_ext_dbt_s diskette_param_table2 VARFSEG = {
     .data_rate      = 0,    // data transfer rate
     .drive_type     = 4,    // drive type in cmos
 };
+
+struct floppy_dbt_s diskette_param_table VAR16FIXED(0xefc7);
 
 struct floppyinfo_s {
     struct chs_s chs;
@@ -244,7 +246,6 @@ floppy_pio(int command, u8 *param)
                 floppy_disable_controller();
                 return DISK_RET_ETIMEOUT;
             }
-            yield();
             continue;
         }
         if (sts & 0x40) {
@@ -278,7 +279,6 @@ floppy_pio(int command, u8 *param)
                 floppy_disable_controller();
                 return DISK_RET_ETIMEOUT;
             }
-            yield();
             continue;
         }
         if (i >= receive) {
@@ -613,7 +613,7 @@ floppy_format(struct disk_op_s *op)
 }
 
 int
-floppy_process_op(struct disk_op_s *op)
+process_floppy_op(struct disk_op_s *op)
 {
     if (!CONFIG_FLOPPY)
         return 0;

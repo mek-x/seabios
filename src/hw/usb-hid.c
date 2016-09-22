@@ -30,7 +30,7 @@ set_protocol(struct usb_pipe *pipe, u16 val)
     req.wValue = val;
     req.wIndex = 0;
     req.wLength = 0;
-    return usb_send_default_control(pipe, &req, NULL);
+    return send_default_control(pipe, &req, NULL);
 }
 
 // Send USB HID SetIdle request.
@@ -43,7 +43,7 @@ set_idle(struct usb_pipe *pipe, int ms)
     req.wValue = (ms/4)<<8;
     req.wIndex = 0;
     req.wLength = 0;
-    return usb_send_default_control(pipe, &req, NULL);
+    return send_default_control(pipe, &req, NULL);
 }
 
 #define KEYREPEATWAITMS 500
@@ -109,7 +109,7 @@ usb_mouse_setup(struct usbdevice_s *usbdev
 int
 usb_hid_setup(struct usbdevice_s *usbdev)
 {
-    if (! CONFIG_USB_KEYBOARD && ! CONFIG_USB_MOUSE)
+    if (! (CONFIG_USB_KEYBOARD || CONFIG_USB_MOUSE))
         return -1;
     dprintf(2, "usb_hid_setup %p\n", usbdev->defpipe);
 
@@ -119,7 +119,7 @@ usb_hid_setup(struct usbdevice_s *usbdev)
         return -1;
 
     // Find intr in endpoint.
-    struct usb_endpoint_descriptor *epdesc = usb_find_desc(
+    struct usb_endpoint_descriptor *epdesc = findEndPointDesc(
         usbdev, USB_ENDPOINT_XFER_INT, USB_DIR_IN);
     if (!epdesc) {
         dprintf(1, "No usb hid intr in?\n");

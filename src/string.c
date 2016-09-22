@@ -1,6 +1,7 @@
 // String manipulation functions.
 //
 // Copyright (C) 2008-2013  Kevin O'Connor <kevin@koconnor.net>
+// Copyright (C) 2014  Sage Electronic Engineering, LLC
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
@@ -40,19 +41,6 @@ strlen(const char *s)
     while (*p)
         p++;
     return p-s;
-}
-
-int
-memcmp_far(u16 s1seg, const void *s1, u16 s2seg, const void *s2, size_t n)
-{
-    while (n--) {
-        int d = GET_FARVAR(s1seg, *(u8*)s1) - GET_FARVAR(s2seg, *(u8*)s2);
-        if (d)
-            return d < 0 ? -1 : 1;
-        s1++;
-        s2++;
-    }
-    return 0;
 }
 
 // Compare two areas of memory.
@@ -227,7 +215,7 @@ strtcpy(char *dest, const char *src, size_t len)
     return dest;
 }
 
-// locate first occurrence of character c in the string s
+// locate first occurance of character c in the string s
 char *
 strchr(const char *s, int c)
 {
@@ -248,4 +236,146 @@ nullTrailingSpace(char *buf)
     while (*buf && *buf <= ' ')
         buf++;
     return buf;
+}
+
+static inline int isupper(int c)
+{
+    return (c >= 'A' && c <= 'Z');
+}
+
+static inline int tolower(int c)
+{
+    if (isupper(c))
+        c -= 'A'-'a';
+    return c;
+}
+
+int strnicmp(const char *s1, const char *s2, int maxlen)
+{
+    int i;
+
+    for (i = 0; i < maxlen; i++) {
+        if (tolower(s1[i]) != tolower(s2[i]))
+            return (tolower(s1[i]) - tolower(s2[i]));
+    }
+
+    return 0;
+}
+
+int isspace(int c)
+{
+    return (c == ' ' || (c >= '\t' && c <= '\r'));
+}
+
+// Check that a character is in the valid range for the given base
+
+static int _valid(char ch, int base)
+{
+    char end = (base > 9) ? '9' : '0' + (base - 1);
+
+    // all bases will be some subset of the 0-9 range
+
+    if (ch >= '0' && ch <= end)
+        return 1;
+
+    // Bases > 11 will also have to match in the a-z range
+
+    if (base > 11) {
+        if (tolower(ch) >= 'a' &&
+            tolower(ch) <= 'a' + (base - 11))
+            return 1;
+    }
+
+    return 0;
+}
+
+// Return the "value" of the character in the given base
+
+static int _offset(char ch, int base)
+{
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+    else
+        return 10 + tolower(ch) - 'a';
+}
+
+// Convert the initial portion of a string into a signed int
+// @param ptr A pointer to the string to convert
+// @param endptr A pointer to the unconverted part of the string
+// @param base The base of the number to convert, or 0 for auto
+// @return A signed integer representation of the string
+
+long int strtol(const char *ptr, char **endptr, int base)
+{
+    int ret = 0;
+    int negative = 1;
+
+    if (endptr != NULL)
+        *endptr = (char *) ptr;
+
+    // Purge whitespace
+
+    for( ; *ptr && isspace(*ptr); ptr++);
+
+    if (ptr[0] == '-') {
+        negative = -1;
+        ptr++;
+    }
+
+    if (!*ptr)
+        return 0;
+
+    // Determine the base
+
+    if (base == 0) {
+        if (ptr[0] == '0' && (ptr[1] == 'x' || ptr[1] == 'X'))
+            base = 16;
+        else if (ptr[0] == '0') {
+            base = 8;
+            ptr++;
+        }
+        else
+            base = 10;
+    }
+
+    // Base 16 allows the 0x on front - so skip over it
+
+    if (base == 16) {
+        if (ptr[0] == '0' && (ptr[1] == 'x' || ptr[1] == 'X'))
+            ptr += 2;
+    }
+
+    // If the first character isn't valid, then don't bother
+
+    if (!*ptr || !_valid(*ptr, base))
+        return 0;
+
+    for( ; *ptr && _valid(*ptr, base); ptr++)
+        ret = (ret * base) + _offset(*ptr, base);
+
+    if (endptr != NULL)
+        *endptr = (char *) ptr;
+
+    return ret * negative;
+}
+
+/**
+ * Find a substring within a string.
+ *
+ * @param h The haystack string.
+ * @param n The needle string (substring).
+ * @return A pointer to the first occurence of the substring in
+ * the string, or NULL if the substring was not encountered within the string.
+ */
+char *strstr(const char *h, const char *n)
+{
+	int hn = strlen(h);
+	int nn = strlen(n);
+	int i;
+
+	for (i = 0; i <= hn - nn; i++)
+		if (!memcmp(&h[i], n, nn))
+			return (char *)&h[i];
+
+	return NULL;
 }

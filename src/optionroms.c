@@ -2,14 +2,14 @@
 //
 // Copyright (C) 2008  Kevin O'Connor <kevin@koconnor.net>
 // Copyright (C) 2002  MandrakeSoft S.A.
+// Copyright (C) 2013-2014  Sage Electronic Engineering, LLC.
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include "bregs.h" // struct bregs
 #include "config.h" // CONFIG_*
 #include "farptr.h" // FLATPTR_TO_SEG
-#include "hw/pci.h" // pci_config_readl
-#include "hw/pcidevice.h" // foreachpci
+#include "hw/pci.h" // foreachpci
 #include "hw/pci_ids.h" // PCI_CLASS_DISPLAY_VGA
 #include "hw/pci_regs.h" // PCI_ROM_ADDRESS
 #include "malloc.h" // rom_confirm
@@ -20,9 +20,6 @@
 #include "std/pnpbios.h" // PNP_SIGNATURE
 #include "string.h" // memset
 #include "util.h" // get_pnp_offset
-#include "tcgbios.h" // tpm_*
-
-static int EnforceChecksum, S3ResumeVga, RunPCIroms;
 
 
 /****************************************************************
@@ -63,6 +60,8 @@ call_bcv(u16 seg, u16 ip)
 {
     __callrom(MAKE_FLATPTR(seg, 0), ip, 0);
 }
+
+static int EnforceChecksum;
 
 // Verify that an option rom looks valid
 static int
@@ -124,6 +123,11 @@ get_pci_rom(struct rom_header *rom)
 static int
 init_optionrom(struct rom_header *rom, u16 bdf, int isvga)
 {
+#if CONFIG_PRINT_TIMESTAMPS
+    u64 tscval;
+    char *romtype;
+#endif
+
     if (! is_valid_rom(rom))
         return -1;
     struct rom_header *newrom = rom_reserve(rom->size * 512);
@@ -134,11 +138,28 @@ init_optionrom(struct rom_header *rom, u16 bdf, int isvga)
     if (newrom != rom)
         memmove(newrom, rom, rom->size * 512);
 
-    tpm_option_rom(newrom, rom->size * 512);
+    if (isvga || get_pnp_rom(newrom)) {
+#if CONFIG_PRINT_TIMESTAMPS
+        tscval = rdtscll();
+        if (isvga)
+            romtype = "VBIOS";
+        else
+            romtype = "option rom";
+        dprintf(1, "TSC: Before %s: 0x%08lx_%08lx\n", romtype,
+            (unsigned long)(tscval >> 32),
+            (unsigned long)tscval);
+#endif
 
-    if (isvga || get_pnp_rom(newrom))
         // Only init vga and PnP roms here.
         callrom(newrom, bdf);
+
+#if CONFIG_PRINT_TIMESTAMPS
+        tscval = rdtscll();
+        dprintf(1, "TSC: After %s: 0x%08lx_%08lx\n", romtype,
+            (unsigned long)(tscval >> 32),
+            (unsigned long)tscval);
+#endif
+    }
 
     return rom_confirm(newrom->size * 512);
 }
@@ -184,26 +205,51 @@ deploy_romfile(struct romfile_s *file)
     return rom;
 }
 
+// Check if an option rom is at a hardcoded location or in CBFS.
+static struct rom_header *
+lookup_hardcode(struct pci_device *pci)
+{
+    char fname[17];
+    snprintf(fname, sizeof(fname), "pci%04x,%04x.rom"
+             , pci->vendor, pci->device);
+    struct romfile_s *file = romfile_find(fname);
+    if (file)
+        return deploy_romfile(file);
+    return NULL;
+}
+
 // Run all roms in a given CBFS directory.
 static void
 run_file_roms(const char *prefix, int isvga, u64 *sources)
 {
-    int pxen = find_pxen();
     struct romfile_s *file = NULL;
+    char *value;
+    char test_string[] = {"pxen0"};
+    char pxe_skip = 0;
+
+    if (CONFIG_CHECK_FOR_PXE_LOAD_DISABLED) {
+        // Check to see if the bootorder file has the string "pxen0".
+        value = cbfs_find_string(test_string, "bootorder");
+        if (value)
+            pxe_skip = 1;
+    }
+
     for (;;) {
         file = romfile_findprefix(prefix, file);
         if (!file)
             break;
-        if (strcmp(file->name, "genroms/pxe.rom") || (pxen == 1))
-        {
-            struct rom_header *rom = deploy_romfile(file);
-            if (rom) {
-                setRomSource(sources, rom, (u32)file);
-                init_optionrom(rom, 0, isvga);
-            }
+
+        if ( pxe_skip && strstr(file->name,"pxe"))
+                continue;
+
+        struct rom_header *rom = deploy_romfile(file);
+        if (rom) {
+            setRomSource(sources, rom, (u32)file);
+            init_optionrom(rom, 0, isvga);
         }
     }
 }
+
 
 /****************************************************************
  * PCI roms
@@ -247,7 +293,9 @@ copy_rom(struct rom_header *rom)
 static struct rom_header *
 map_pcirom(struct pci_device *pci)
 {
-    dprintf(6, "Attempting to map option rom on dev %pP\n", pci);
+    u16 bdf = pci->bdf;
+    dprintf(6, "Attempting to map option rom on dev %02x:%02x.%x\n"
+            , pci_bdf_to_bus(bdf), pci_bdf_to_dev(bdf), pci_bdf_to_fn(bdf));
 
     if ((pci->header_type & 0x7f) != PCI_HEADER_TYPE_NORMAL) {
         dprintf(6, "Skipping non-normal pci device (type=%x)\n"
@@ -255,7 +303,6 @@ map_pcirom(struct pci_device *pci)
         return NULL;
     }
 
-    u16 bdf = pci->bdf;
     u32 orig = pci_config_readl(bdf, PCI_ROM_ADDRESS);
     pci_config_writel(bdf, PCI_ROM_ADDRESS, ~PCI_ROM_ADDRESS_ENABLE);
     u32 sz = pci_config_readl(bdf, PCI_ROM_ADDRESS);
@@ -277,8 +324,10 @@ map_pcirom(struct pci_device *pci)
 
     struct rom_header *rom = (void*)orig;
     for (;;) {
-        dprintf(5, "Inspecting possible rom at %p (vd=%04x:%04x bdf=%pP)\n"
-                , rom, pci->vendor, pci->device, pci);
+        dprintf(5, "Inspecting possible rom at %p (vd=%04x:%04x"
+                " bdf=%02x:%02x.%x)\n"
+                , rom, pci->vendor, pci->device
+                , pci_bdf_to_bus(bdf), pci_bdf_to_dev(bdf), pci_bdf_to_fn(bdf));
         if (rom->signature != OPTION_ROM_SIGNATURE) {
             dprintf(6, "No option rom signature (got %x)\n", rom->signature);
             goto fail;
@@ -312,26 +361,21 @@ fail:
 }
 
 // Attempt to map and initialize the option rom on a given PCI device.
-static void
+static int
 init_pcirom(struct pci_device *pci, int isvga, u64 *sources)
 {
-    dprintf(4, "Attempting to init PCI bdf %pP (vd %04x:%04x)\n"
-            , pci, pci->vendor, pci->device);
-
-    char fname[17];
-    snprintf(fname, sizeof(fname), "pci%04x,%04x.rom"
-             , pci->vendor, pci->device);
-    struct romfile_s *file = romfile_find(fname);
-    struct rom_header *rom = NULL;
-    if (file)
-        rom = deploy_romfile(file);
-    else if (RunPCIroms > 1 || (RunPCIroms == 1 && isvga))
+    u16 bdf = pci->bdf;
+    dprintf(4, "Attempting to init PCI bdf %02x:%02x.%x (vd %04x:%04x)\n"
+            , pci_bdf_to_bus(bdf), pci_bdf_to_dev(bdf), pci_bdf_to_fn(bdf)
+            , pci->vendor, pci->device);
+    struct rom_header *rom = lookup_hardcode(pci);
+    if (! rom)
         rom = map_pcirom(pci);
     if (! rom)
         // No ROM present.
-        return;
+        return -1;
     setRomSource(sources, rom, RS_PCIROM | (u32)pci);
-    init_optionrom(rom, pci->bdf, isvga);
+    return init_optionrom(rom, bdf, isvga);
 }
 
 
@@ -350,16 +394,28 @@ optionrom_setup(void)
     memset(sources, 0, sizeof(sources));
     u32 post_vga = rom_get_last();
 
-    // Find and deploy PCI roms.
-    struct pci_device *pci;
-    foreachpci(pci) {
-        if (pci->class == PCI_CLASS_DISPLAY_VGA || pci->have_driver)
-            continue;
-        init_pcirom(pci, 0, sources);
-    }
+    if (CONFIG_OPTIONROMS_DEPLOYED) {
+        // Option roms are already deployed on the system.
+        u32 pos = post_vga;
+        while (pos < rom_get_max()) {
+            int ret = init_optionrom((void*)pos, 0, 0);
+            if (ret)
+                pos += OPTION_ROM_ALIGN;
+            else
+                pos = rom_get_last();
+        }
+    } else {
+        // Find and deploy PCI roms.
+        struct pci_device *pci;
+        foreachpci(pci) {
+            if (pci->class == PCI_CLASS_DISPLAY_VGA || pci->have_driver)
+                continue;
+            init_pcirom(pci, 0, sources);
+        }
 
-    // Find and deploy CBFS roms not associated with a device.
-    run_file_roms("genroms/", 0, sources);
+        // Find and deploy CBFS roms not associated with a device.
+        run_file_roms("genroms/", 0, sources);
+    }
     rom_reserve(0);
 
     // All option roms found and deployed - now build BEV/BCV vectors.
@@ -400,6 +456,7 @@ optionrom_setup(void)
  * VGA init
  ****************************************************************/
 
+static int S3ResumeVga;
 int ScreenAndDebug;
 struct rom_header *VgaROM;
 
@@ -415,24 +472,28 @@ vgarom_setup(void)
     // Load some config settings that impact VGA.
     EnforceChecksum = romfile_loadint("etc/optionroms-checksum", 1);
     S3ResumeVga = romfile_loadint("etc/s3-resume-vga-init", CONFIG_QEMU);
-    RunPCIroms = romfile_loadint("etc/pci-optionrom-exec", 2);
     ScreenAndDebug = romfile_loadint("etc/screen-and-debug", 1);
 
-    // Clear option rom memory
-    memset((void*)BUILD_ROM_START, 0, rom_get_max() - BUILD_ROM_START);
+    if (CONFIG_OPTIONROMS_DEPLOYED) {
+        // Option roms are already deployed on the system.
+        init_optionrom((void*)BUILD_ROM_START, 0, 1);
+    } else {
+        // Clear option rom memory
+        memset((void*)BUILD_ROM_START, 0, rom_get_max() - BUILD_ROM_START);
 
-    // Find and deploy PCI VGA rom.
-    struct pci_device *pci;
-    foreachpci(pci) {
-        if (!is_pci_vga(pci))
-            continue;
-        vgahook_setup(pci);
-        init_pcirom(pci, 1, NULL);
-        break;
+        // Find and deploy PCI VGA rom.
+        struct pci_device *pci;
+        foreachpci(pci) {
+            if (!is_pci_vga(pci))
+                continue;
+            vgahook_setup(pci);
+            init_pcirom(pci, 1, NULL);
+            break;
+        }
+
+        // Find and deploy CBFS vga-style roms not associated with a device.
+        run_file_roms("vgaroms/", 1, NULL);
     }
-
-    // Find and deploy CBFS vga-style roms not associated with a device.
-    run_file_roms("vgaroms/", 1, NULL);
     rom_reserve(0);
 
     if (rom_get_last() == BUILD_ROM_START)

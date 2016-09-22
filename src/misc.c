@@ -2,6 +2,7 @@
 //
 // Copyright (C) 2008,2009  Kevin O'Connor <kevin@koconnor.net>
 // Copyright (C) 2002  MandrakeSoft S.A.
+// Copyright (C) 2014 Sage Electronic Engineering, Inc.
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
@@ -11,18 +12,9 @@
 #include "output.h" // debug_enter
 #include "stacks.h" // call16_int
 #include "string.h" // memset
-#include "hw/serialio.h" 
+#include "hw/serialio.h" // SEROFF_LSR/SEROFF_DATA
 
 #define PORT_MATH_CLEAR        0x00f0
-
-// Indicator if POST phase has been started (and if it has completed).
-int HaveRunPost VARFSEG;
-
-int
-in_post(void)
-{
-    return GET_GLOBAL(HaveRunPost) == 1;
-}
 
 
 /****************************************************************
@@ -52,24 +44,40 @@ handle_05(struct bregs *regs)
     debug_enter(regs, DEBUG_HDL_05);
 }
 
+#if CONFIG_INT10_SERIAL_CONSOLE
+static void
+int10_com_output( char c )
+{
+#define UART_THRE (1 << 5)
+    int timeout = 100000;
+
+    while ((inb(CONFIG_DEBUG_SERIAL_PORT + SEROFF_LSR) & UART_THRE) != UART_THRE)
+        if (!timeout--) return;
+    outb(c, CONFIG_DEBUG_SERIAL_PORT + SEROFF_DATA);
+}
+#endif
 
 // INT 10h Video Support Service Entry Point
 void VISIBLE16
 handle_10(struct bregs *regs)
 {
     debug_enter(regs, DEBUG_HDL_10);
-    // don't do anything, since the VGA BIOS handles int10h requests
-#if CONFIG_SEABIOS_SERIAL_CONSOLE
+    // dont do anything, since the VGA BIOS handles int10h requests
+#if CONFIG_INT10_SERIAL_CONSOLE
+    /* If we don't have a vbios send it to the COM port. The video_mode
+     * index in the BDA is used to determine if the INT10 character
+     * will be output to the serial console. This feature is used
+     * to prevent option roms and printf's in seabios from outputting
+     * characters to the serial console when no serial console
+     * output is desired.
+     */
     switch (regs->ah) {
     case 0x0A: // Write char at cursor
     case 0x0E: // Write text in tele-type mode
-		{
-		#define UART_THRE (1 << 5)
-		    int timeout = 100000;
-
-		    while ((inb(CONFIG_DEBUG_SERIAL_PORT + SEROFF_LSR) & UART_THRE) != UART_THRE)
-		        if (!timeout--) return;
-		}
+#if CONFIG_CHECK_CMOS_SETTING_FOR_CONSOLE_ENABLE
+        if (GET_BDA(video_mode) == UART_OUTPUT_ENABLED)
+#endif
+            int10_com_output(regs->al);
         break;
     default:
         dprintf(2, "unhandled INT10 ah=%x al=%x\n",regs->ah,regs->al);
@@ -136,7 +144,7 @@ handle_75(void)
 // INT 16/AH=09h (keyboard functionality) supported
 #define CBT_F2_INT1609  (1<<6)
 
-struct bios_config_table_s BIOS_CONFIG_TABLE VARFSEGFIXED(0xe6f5) = {
+struct bios_config_table_s BIOS_CONFIG_TABLE VAR16FIXED(0xe6f5) = {
     .size     = sizeof(BIOS_CONFIG_TABLE) - 2,
     .model    = BUILD_MODEL_ID,
     .submodel = BUILD_SUBMODEL_ID,
@@ -200,23 +208,18 @@ struct descloc_s rombios32_gdt_48 VARFSEG = {
  * Misc fixed vars
  ****************************************************************/
 
+char BiosCopyright[] VAR16FIXED(0xff00) =
+    "(c) 2002 MandrakeSoft S.A. Written by Kevin Lawton & the Bochs team.";
+
 // BIOS build date
-char BiosDate[] VARFSEGFIXED(0xfff5) = "06/23/99";
+char BiosDate[] VAR16FIXED(0xfff5) = "06/23/99";
 
-u8 BiosModelId VARFSEGFIXED(0xfffe) = BUILD_MODEL_ID;
+u8 BiosModelId VAR16FIXED(0xfffe) = BUILD_MODEL_ID;
 
-u8 BiosChecksum VARFSEGFIXED(0xffff);
-
-struct floppy_dbt_s diskette_param_table VARFSEGFIXED(0xefc7);
-
-// Old Fixed Disk Parameter Table (newer tables are in the ebda).
-struct fdpt_s OldFDPT VARFSEGFIXED(0xe401);
-
-// XXX - Baud Rate Generator Table
-u8 BaudTable[16] VARFSEGFIXED(0xe729);
+u8 BiosChecksum VAR16FIXED(0xffff);
 
 // XXX - Initial Interrupt Vector Offsets Loaded by POST
-u8 InitVectors[13] VARFSEGFIXED(0xfef3);
+u8 InitVectors[13] VAR16FIXED(0xfef3);
 
 // XXX - INT 1D - SYSTEM DATA - VIDEO PARAMETER TABLES
-u8 VideoParams[88] VARFSEGFIXED(0xf0a4);
+u8 VideoParams[88] VAR16FIXED(0xf0a4);

@@ -14,10 +14,6 @@
 #define CR0_NW (1<<29) // Not Write-through
 #define CR0_PE (1<<0)  // Protection enable
 
-// PORT_A20 bitdefs
-#define PORT_A20 0x0092
-#define A20_ENABLE_BIT 0x02
-
 #ifndef __ASSEMBLY__
 
 #include "types.h" // u32
@@ -75,21 +71,13 @@ static inline void __cpuid(u32 index, u32 *eax, u32 *ebx, u32 *ecx, u32 *edx)
         : "0" (index));
 }
 
-static inline u32 cr0_read(void) {
+static inline u32 getcr0(void) {
     u32 cr0;
     asm("movl %%cr0, %0" : "=r"(cr0));
     return cr0;
 }
-static inline void cr0_write(u32 cr0) {
+static inline void setcr0(u32 cr0) {
     asm("movl %0, %%cr0" : : "r"(cr0));
-}
-static inline void cr0_mask(u32 off, u32 on) {
-    cr0_write((cr0_read() & ~off) | on);
-}
-static inline u16 cr0_vm86_read(void) {
-    u16 cr0;
-    asm("smsww %0" : "=r"(cr0));
-    return cr0;
 }
 
 static inline u64 rdmsr(u32 index)
@@ -130,13 +118,6 @@ static inline u32 getesp(void) {
     u32 esp;
     asm("movl %%esp, %0" : "=rm"(esp));
     return esp;
-}
-
-static inline u32 rol(u32 val, u16 rol) {
-    u32 res;
-    asm volatile("roll %%cl, %%eax"
-                 : "=a" (res) : "a" (val), "c" (rol));
-    return res;
 }
 
 static inline void outb(u8 value, u16 port) {
@@ -190,40 +171,23 @@ static inline void outsl(u16 port, u32 *data, u32 count) {
                  : "+c"(count), "+S"(data) : "d"(port) : "memory");
 }
 
-/* Compiler barrier is enough as an x86 CPU does not reorder reads or writes */
-static inline void smp_rmb(void) {
-    barrier();
-}
-static inline void smp_wmb(void) {
-    barrier();
-}
-
 static inline void writel(void *addr, u32 val) {
-    barrier();
     *(volatile u32 *)addr = val;
 }
 static inline void writew(void *addr, u16 val) {
-    barrier();
     *(volatile u16 *)addr = val;
 }
 static inline void writeb(void *addr, u8 val) {
-    barrier();
     *(volatile u8 *)addr = val;
 }
 static inline u32 readl(const void *addr) {
-    u32 val = *(volatile const u32 *)addr;
-    barrier();
-    return val;
+    return *(volatile const u32 *)addr;
 }
 static inline u16 readw(const void *addr) {
-    u16 val = *(volatile const u16 *)addr;
-    barrier();
-    return val;
+    return *(volatile const u16 *)addr;
 }
 static inline u8 readb(const void *addr) {
-    u8 val = *(volatile const u8 *)addr;
-    barrier();
-    return val;
+    return *(volatile const u8 *)addr;
 }
 
 // GDT bits
@@ -252,18 +216,9 @@ static inline void lgdt(struct descloc_s *desc) {
     asm("lgdtl %0" : : "m"(*desc) : "memory");
 }
 
-static inline u8 get_a20(void) {
-    return (inb(PORT_A20) & A20_ENABLE_BIT) != 0;
-}
-
-static inline u8 set_a20(u8 cond) {
-    u8 val = inb(PORT_A20);
-    outb((val & ~A20_ENABLE_BIT) | (cond ? A20_ENABLE_BIT : 0), PORT_A20);
-    return (val & A20_ENABLE_BIT) != 0;
-}
-
 // x86.c
 void cpuid(u32 index, u32 *eax, u32 *ebx, u32 *ecx, u32 *edx);
+
 
 #endif // !__ASSEMBLY__
 

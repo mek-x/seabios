@@ -63,27 +63,25 @@ usb_msc_send(struct usbdrive_s *udrive_gf, int dir, void *buf, u32 bytes)
 
 // Low-level usb command transmit function.
 int
-usb_process_op(struct disk_op_s *op)
+usb_cmd_data(struct disk_op_s *op, void *cdbcmd, u16 blocksize)
 {
     if (!CONFIG_USB_MSC)
         return 0;
 
-    dprintf(16, "usb_cmd_data id=%p write=%d count=%d buf=%p\n"
-            , op->drive_gf, 0, op->count, op->buf_fl);
+    dprintf(16, "usb_cmd_data id=%p write=%d count=%d bs=%d buf=%p\n"
+            , op->drive_gf, 0, op->count, blocksize, op->buf_fl);
     struct usbdrive_s *udrive_gf = container_of(
         op->drive_gf, struct usbdrive_s, drive);
 
     // Setup command block wrapper.
+    u32 bytes = blocksize * op->count;
     struct cbw_s cbw;
     memset(&cbw, 0, sizeof(cbw));
-    int blocksize = scsi_fill_cmd(op, cbw.CBWCB, USB_CDB_SIZE);
-    if (blocksize < 0)
-        return default_process_op(op);
-    u32 bytes = blocksize * op->count;
+    memcpy(cbw.CBWCB, cdbcmd, USB_CDB_SIZE);
     cbw.dCBWSignature = CBW_SIGNATURE;
     cbw.dCBWTag = 999; // XXX
     cbw.dCBWDataTransferLength = bytes;
-    cbw.bmCBWFlags = scsi_is_read(op) ? USB_DIR_IN : USB_DIR_OUT;
+    cbw.bmCBWFlags = cdb_is_read(cdbcmd, blocksize) ? USB_DIR_IN : USB_DIR_OUT;
     cbw.bCBWLUN = GET_GLOBALFLAT(udrive_gf->lun);
     cbw.bCBWCBLength = USB_CDB_SIZE;
 
@@ -132,7 +130,7 @@ usb_msc_maxlun(struct usb_pipe *pipe)
     req.wIndex = 0;
     req.wLength = 1;
     unsigned char maxlun;
-    int ret = usb_send_default_control(pipe, &req, &maxlun);
+    int ret = send_default_control(pipe, &req, &maxlun);
     if (ret)
         return 0;
     return maxlun;
@@ -191,9 +189,9 @@ usb_msc_setup(struct usbdevice_s *usbdev)
 
     // Find bulk in and bulk out endpoints.
     struct usb_pipe *inpipe = NULL, *outpipe = NULL;
-    struct usb_endpoint_descriptor *indesc = usb_find_desc(
+    struct usb_endpoint_descriptor *indesc = findEndPointDesc(
         usbdev, USB_ENDPOINT_XFER_BULK, USB_DIR_IN);
-    struct usb_endpoint_descriptor *outdesc = usb_find_desc(
+    struct usb_endpoint_descriptor *outdesc = findEndPointDesc(
         usbdev, USB_ENDPOINT_XFER_BULK, USB_DIR_OUT);
     if (!indesc || !outdesc)
         goto fail;
@@ -216,7 +214,7 @@ usb_msc_setup(struct usbdevice_s *usbdev)
     return 0;
 fail:
     dprintf(1, "Unable to configure USB MSC device.\n");
-    usb_free_pipe(usbdev, inpipe);
-    usb_free_pipe(usbdev, outpipe);
+    free_pipe(inpipe);
+    free_pipe(outpipe);
     return -1;
 }
