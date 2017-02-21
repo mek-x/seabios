@@ -353,7 +353,7 @@ optionrom_setup(void)
     // Find and deploy PCI roms.
     struct pci_device *pci;
     foreachpci(pci) {
-        if (pci->class == PCI_CLASS_DISPLAY_VGA || pci->have_driver)
+        if (pci->class == PCI_CLASS_DISPLAY_VGA)// || pci->have_driver)
             continue;
         init_pcirom(pci, 0, sources);
     }
