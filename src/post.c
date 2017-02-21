@@ -201,21 +201,21 @@ maininit(void)
     // Setup platform devices.
     platform_hardware_setup();
 
+    // Run vga option rom
+    vgarom_setup();
+
+    // Run option roms
+    optionrom_setup();
+
     // Start hardware initialization (if threads allowed during optionroms)
     if (threads_during_optionroms())
         device_hardware_setup();
-
-    // Run vga option rom
-    vgarom_setup();
 
     // Do hardware initialization (if running synchronously)
     if (!threads_during_optionroms()) {
         device_hardware_setup();
         wait_threads();
     }
-
-    // Run option roms
-    optionrom_setup();
 
     // Allow user to modify overall boot order.
     interactive_bootmenu();
